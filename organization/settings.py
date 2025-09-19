@@ -122,6 +122,7 @@ CORS_ALLOWED_ORIGINS = [
     'http://127.0.0.1:5173',
     'http://172.20.112.1:5173',
     'https://quantumfinanceai.onrender.com',
+    "https://quantum-ai-frontend.vercel.app",
 ]
 CORS_ALLOW_CREDENTIALS = False  # Set to False for JWT
 CSRF_TRUSTED_ORIGINS = [
@@ -129,6 +130,7 @@ CSRF_TRUSTED_ORIGINS = [
     'http://127.0.0.1:5173',
     'http://172.20.112.1:5173',
     'https://quantumfinanceai.onrender.com',
+    "https://quantum-ai-frontend.vercel.app",  # <-- add this
 ]
 
 # Rest Framework - Update for JWT
