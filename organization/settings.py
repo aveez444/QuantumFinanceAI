@@ -74,20 +74,30 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'organization.wsgi.application'
-
+# settings.py — DATABASES replacement (paste over previous DATABASES code)
 import dj_database_url
 
-DATABASES = {
-    "default": dj_database_url.parse(
-        os.environ.get(
-            "DATABASE_URL",
-            # local fallback used only for local dev when DATABASE_URL is not set
-            "postgresql://postgres:postgres@localhost:5432/erp_multitenant"
-        ),
-        conn_max_age=600,
-        ssl_require=True
-    )
-}
+# Parse the DATABASE_URL with no persistent connections (conn_max_age=0)
+# This avoids re-using connections that the provider / pooler might have closed.
+_db_url = os.environ.get(
+    "DATABASE_URL",
+    # local fallback used only for local dev when DATABASE_URL is not set
+    "postgresql://postgres:postgres@localhost:5432/erp_multitenant"
+)
+
+# Use conn_max_age=0 temporarily to avoid stale SSL connections reused across requests
+db_conf = dj_database_url.parse(_db_url, conn_max_age=0, ssl_require=True)
+
+# Ensure explicit options so connect timeout and sslmode are set
+db_conf.setdefault("OPTIONS", {})
+# Preserve any channel_binding param already provided in the URL by dj_database_url;
+# add connect_timeout and ensure sslmode is explicitly present.
+db_conf["OPTIONS"].update({
+    "connect_timeout": 10,   # fail fast on network issues
+    "sslmode": db_conf["OPTIONS"].get("sslmode", "require"),
+})
+
+DATABASES = {"default": db_conf}
 
 AI_SETTINGS = {
     'GROQ_API_KEY': os.getenv('GROQ_API_KEY', ''),
@@ -265,3 +275,4 @@ LOGGING = {
 }
 
 os.makedirs(BASE_DIR / 'logs', exist_ok=True)
+

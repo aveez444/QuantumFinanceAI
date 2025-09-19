@@ -1,11 +1,13 @@
-# core/middleware.py - Multi-tenant Middleware
-
+# core/middleware.py
 from django.core.cache import cache
-from django.http import HttpResponseForbidden, JsonResponse
+from django.http import HttpResponseForbidden, JsonResponse, HttpResponseServerError
 from django.shortcuts import get_object_or_404
 from .models import Tenant, TenantUser
 import threading
+from django.db import OperationalError
+import logging
 
+logger = logging.getLogger("core")
 
 # Thread-local tenant context
 _thread_local = threading.local()
@@ -22,8 +24,14 @@ class TenantMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        # Resolve tenant
-        tenant = self.resolve_tenant(request)
+        # Resolve tenant with defensive DB error handling
+        try:
+            tenant = self.resolve_tenant(request)
+        except OperationalError as exc:
+            # Log full exception (goes to your console + file logger)
+            logger.exception("Database OperationalError while resolving tenant: %s", exc)
+            # Return a safe 503 Service Unavailable so frontend sees a clear response
+            return HttpResponseServerError("Service temporarily unavailable (database). Please try again shortly.")
 
         # Attach tenant to request + thread-local
         request.tenant = tenant
@@ -39,7 +47,11 @@ class TenantMiddleware:
 
         # Cleanup thread-local
         if hasattr(_thread_local, "tenant"):
-            delattr(_thread_local, "tenant")
+            try:
+                delattr(_thread_local, "tenant")
+            except Exception:
+                # best-effort cleanup; don't raise
+                pass
 
         return response
 
@@ -81,7 +93,9 @@ def get_current_tenant():
 
 
 # Custom Manager for automatic tenant filtering
-class TenantManager:
+from django.db import models
+
+class TenantManager(models.Manager):
     """Manager that automatically filters by tenant"""
     
     def get_queryset(self):
@@ -96,8 +110,6 @@ class TenantManager:
 
 
 # Tenant-aware base manager
-from django.db import models
-
 class TenantAwareManager(models.Manager):
     """Manager that automatically filters by current tenant"""
     
