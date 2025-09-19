@@ -5,7 +5,7 @@ import os
 from dotenv import load_dotenv
 from datetime import timedelta
 import dj_database_url
-from pathlib import Path
+
 
 load_dotenv()
 
