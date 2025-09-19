@@ -205,11 +205,7 @@ if not DEBUG:
     SECURE_BROWSER_XSS_FILTER = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
 
-if not DEBUG:
-    LOGGING.get('handlers', {}).pop('file', None)
-    for logger_name, logger_conf in LOGGING.get('loggers', {}).items():
-        logger_conf['handlers'] = ['console']
-    LOGGING['root']['handlers'] = ['console']
+
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
