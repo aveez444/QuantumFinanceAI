@@ -26,7 +26,6 @@ import time  # For execution timing
 import logging
 from .middleware import get_current_tenant
 from .utils import calculate_oee, generate_movement_number, create_automated_gl_entry
-from groq import Groq
 from django.conf import settings
 from .llm_utils import call_llm
 from .ai_orchestrator import AIOrchestrator

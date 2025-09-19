@@ -12,9 +12,18 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Security
+# Security
 SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-this-in-production')
-DEBUG = True
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '127.0.0.1,localhost').split(',')
+
+# Make DEBUG environment-driven so production can disable it safely.
+# Accepts "1", "true", "yes" (case-insensitive) as truthy values.
+DEBUG = os.getenv("DEBUG", "False").lower() in ("1", "true", "yes")
+
+# Default allowed hosts — include local dev hosts. ALLOWED_HOSTS can be set via environment.
+# If you don't set ALLOWED_HOSTS env on Render, this default will still include the Render host below.
+default_allowed = "127.0.0.1,localhost,quantumfinanceai.onrender.com"
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', default_allowed).split(',')
+
 
 # Application definition
 INSTALLED_APPS = [
@@ -111,12 +120,14 @@ CORS_ALLOWED_ORIGINS = [
     'http://localhost:5173',
     'http://127.0.0.1:5173',
     'http://172.20.112.1:5173',
+    'https://quantumfinanceai.onrender.com',
 ]
 CORS_ALLOW_CREDENTIALS = False  # Set to False for JWT
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:5173',
     'http://127.0.0.1:5173',
     'http://172.20.112.1:5173',
+    'https://quantumfinanceai.onrender.com',
 ]
 
 # Rest Framework - Update for JWT
