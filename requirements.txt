@@ -1,4 +1,4 @@
-python-3.12.9
+
 Django==4.2.7
 djangorestframework==3.14.0
 django-cors-headers==4.3.1
