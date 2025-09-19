@@ -1,0 +1,43 @@
+<!-- core/templates/ai_test.html -->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Query Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #query { width: 100%; padding: 10px; margin-bottom: 10px; }
+        #response { border: 1px solid #ccc; padding: 10px; min-height: 100px; }
+        button { padding: 10px 20px; }
+    </style>
+</head>
+<body>
+    <h1>AI Business Assistant Test</h1>
+    <input type="text" id="query" placeholder="Ask about production, inventory, or anything...">
+    <button onclick="sendQuery()">Submit</button>
+    <div id="response">Responses will appear here...</div>
+
+    <script>
+        async function sendQuery() {
+            const query = document.getElementById('query').value;
+            const responseDiv = document.getElementById('response');
+            responseDiv.innerText = 'Processing...';
+
+            try {
+                const response = await fetch('/ai-query/', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': '{{ csrf_token }}'  // Ensure CSRF token is included
+                    },
+                    body: JSON.stringify({ query: query })
+                });
+                const data = await response.json();
+                responseDiv.innerText = data.response || data.error;
+            } catch (error) {
+                responseDiv.innerText = 'Error: Could not process query.';
+                console.error(error);
+            }   
+        }
+    </script>
+</body>
+</html>

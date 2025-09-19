@@ -1,0 +1,202 @@
+{
+    "Tenant": {
+      "fields": {
+        "company_name": "CharField",
+        "subdomain": "CharField(unique)",
+        "plan_type": "ChoiceField[basic, professional, enterprise]",
+        "is_active": "BooleanField",
+        "modules_enabled": "JSONField"
+      },
+      "relations": {
+        "TenantUser": "tenant -> TenantUser.tenant",
+        "BaseModel": "tenant -> BaseModel.tenant"
+      }
+    },
+    "TenantUser": {
+      "fields": {
+        "tenant": "ForeignKey(Tenant)",
+        "user": "ForeignKey(User)",
+        "role": "ChoiceField[admin, manager, operator, viewer]",
+        "is_active": "BooleanField"
+      }
+    },
+    "ChartOfAccounts": {
+      "fields": {
+        "account_code": "CharField",
+        "account_name": "CharField",
+        "account_type": "ChoiceField[asset, liability, equity, revenue, expense, cogs]",
+        "parent_account": "ForeignKey(self)"
+      },
+      "relations": {
+        "GLJournalLine": "account -> GLJournalLine.account"
+      }
+    },
+    "CostCenter": {
+      "fields": {
+        "cost_center_code": "CharField",
+        "name": "CharField",
+        "parent_center": "ForeignKey(self)",
+        "manager": "ForeignKey(Employee)"
+      },
+      "relations": {
+        "Employee": "cost_center -> Employee.cost_center",
+        "WorkOrder": "cost_center -> WorkOrder.cost_center"
+      }
+    },
+    "Product": {
+      "fields": {
+        "sku": "CharField",
+        "product_name": "CharField",
+        "product_type": "ChoiceField[raw_material, finished_good, semi_finished, consumable]",
+        "uom": "ChoiceField[pcs, kg, ltr, mtr, set]",
+        "category": "CharField",
+        "standard_cost": "DecimalField",
+        "reorder_point": "IntegerField",
+        "specifications": "TextField"
+      },
+      "relations": {
+        "WorkOrder": "product -> WorkOrder.product",
+        "StockMovement": "product -> StockMovement.product"
+      }
+    },
+    "Party": {
+      "fields": {
+        "party_code": "CharField",
+        "party_type": "ChoiceField[customer, supplier, other]",
+        "legal_name": "CharField",
+        "display_name": "CharField",
+        "gstin": "CharField",
+        "pan": "CharField",
+        "contact_details": "JSONField",
+        "payment_terms": "IntegerField",
+        "credit_limit": "DecimalField"
+      }
+    },
+    "Equipment": {
+      "fields": {
+        "equipment_code": "CharField",
+        "equipment_name": "CharField",
+        "location": "CharField",
+        "capacity_per_hour": "IntegerField",
+        "acquisition_date": "DateField",
+        "last_maintenance": "DateTimeField",
+        "next_maintenance": "DateTimeField"
+      },
+      "relations": {
+        "ProductionEntry": "equipment -> ProductionEntry.equipment"
+      }
+    },
+    "Employee": {
+      "fields": {
+        "employee_code": "CharField",
+        "full_name": "CharField",
+        "department": "CharField",
+        "designation": "CharField",
+        "cost_center": "ForeignKey(CostCenter)",
+        "hourly_rate": "DecimalField",
+        "skill_level": "IntegerField",
+        "hire_date": "DateField"
+      },
+      "relations": {
+        "ProductionEntry": "operator -> ProductionEntry.operator"
+      }
+    },
+    "WorkOrder": {
+      "fields": {
+        "wo_number": "CharField",
+        "product": "ForeignKey(Product)",
+        "quantity_planned": "IntegerField",
+        "quantity_completed": "IntegerField",
+        "quantity_scrapped": "IntegerField",
+        "due_date": "DateField",
+        "status": "ChoiceField[planned, released, in_progress, completed, cancelled]",
+        "cost_center": "ForeignKey(CostCenter)",
+        "priority": "IntegerField"
+      },
+      "relations": {
+        "ProductionEntry": "work_order -> ProductionEntry.work_order"
+      }
+    },
+    "ProductionEntry": {
+      "fields": {
+        "work_order": "ForeignKey(WorkOrder)",
+        "equipment": "ForeignKey(Equipment)",
+        "operator": "ForeignKey(Employee)",
+        "entry_datetime": "DateTimeField",
+        "quantity_produced": "IntegerField",
+        "quantity_rejected": "IntegerField",
+        "downtime_minutes": "IntegerField",
+        "downtime_reason": "CharField",
+        "shift": "CharField"
+      }
+    },
+    "Warehouse": {
+      "fields": {
+        "warehouse_code": "CharField",
+        "warehouse_name": "CharField",
+        "location": "CharField",
+        "manager": "ForeignKey(Employee)"
+      },
+      "relations": {
+        "StockMovement": "warehouse -> StockMovement.warehouse"
+      }
+    },
+    "StockMovement": {
+      "fields": {
+        "movement_number": "CharField",
+        "movement_type": "ChoiceField[receipt, issue, transfer_in, transfer_out, adjustment, production_receipt, production_issue]",
+        "product": "ForeignKey(Product)",
+        "warehouse": "ForeignKey(Warehouse)",
+        "quantity": "DecimalField",
+        "unit_cost": "DecimalField",
+        "reference_doc": "CharField",
+        "movement_date": "DateTimeField"
+      }
+    },
+    "GLJournal": {
+      "fields": {
+        "journal_number": "CharField",
+        "posting_date": "DateField",
+        "reference": "CharField",
+        "narration": "TextField",
+        "total_debit": "DecimalField",
+        "total_credit": "DecimalField",
+        "status": "ChoiceField[draft, posted, cancelled]"
+      },
+      "relations": {
+        "GLJournalLine": "journal -> GLJournalLine.journal"
+      }
+    },
+    "GLJournalLine": {
+      "fields": {
+        "journal": "ForeignKey(GLJournal)",
+        "line_number": "IntegerField",
+        "account": "ForeignKey(ChartOfAccounts)",
+        "cost_center": "ForeignKey(CostCenter)",
+        "debit_amount": "DecimalField",
+        "credit_amount": "DecimalField",
+        "description": "CharField"
+      }
+    },
+    "AIQueryLog": {
+      "fields": {
+        "user_query": "TextField",
+        "generated_sql": "TextField",
+        "execution_time_ms": "IntegerField",
+        "result_rows": "IntegerField",
+        "was_successful": "BooleanField",
+        "error_message": "TextField"
+      }
+    },
+    "AutomationRule": {
+      "fields": {
+        "rule_name": "CharField",
+        "trigger_type": "ChoiceField[time_based, event_based, threshold_based]",
+        "trigger_condition": "JSONField",
+        "action_definition": "JSONField",
+        "is_enabled": "BooleanField",
+        "last_executed": "DateTimeField"
+      }
+    }
+  }
+  
