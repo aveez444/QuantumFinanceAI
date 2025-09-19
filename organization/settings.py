@@ -22,7 +22,8 @@ DEBUG = os.getenv("DEBUG", "False").lower() in ("1", "true", "yes")
 # Default allowed hosts — include local dev hosts. ALLOWED_HOSTS can be set via environment.
 # If you don't set ALLOWED_HOSTS env on Render, this default will still include the Render host below.
 default_allowed = "127.0.0.1,localhost,quantumfinanceai.onrender.com"
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', default_allowed).split(',')
+
+ALLOWED_HOSTS = ["quantumfinanceai.onrender.com"]
 
 
 # Application definition
