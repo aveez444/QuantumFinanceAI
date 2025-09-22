@@ -19,11 +19,9 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-this-in-production'
 # Accepts "1", "true", "yes" (case-insensitive) as truthy values.
 DEBUG = os.getenv("DEBUG", "False").lower() in ("1", "true", "yes")
 
-# Default allowed hosts — include local dev hosts. ALLOWED_HOSTS can be set via environment.
-# If you don't set ALLOWED_HOSTS env on Render, this default will still include the Render host below.
-default_allowed = "127.0.0.1,localhost,quantumfinanceai.onrender.com"
 
 ALLOWED_HOSTS = ["quantumfinanceai.onrender.com"]
+
 
 
 # Application definition
@@ -74,30 +72,26 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'organization.wsgi.application'
-# settings.py — DATABASES replacement (paste over previous DATABASES code)
+
 import dj_database_url
 
-# Parse the DATABASE_URL with no persistent connections (conn_max_age=0)
-# This avoids re-using connections that the provider / pooler might have closed.
-_db_url = os.environ.get(
-    "DATABASE_URL",
-    # local fallback used only for local dev when DATABASE_URL is not set
-    "postgresql://postgres:postgres@localhost:5432/erp_multitenant"
-)
+# Database Configuration
+DATABASES = {
+    "default": dj_database_url.parse(
+        os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/erp_multitenant"),
+        conn_max_age=600,
+        ssl_require=True
+    ),
+    "analytics": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("ANALYTICS_DB_NAME", "erp_analytics"),
+        "USER": os.getenv("DB_USER", "postgres"),
+        "PASSWORD": os.getenv("DB_PASSWORD", "1"),
+        "HOST": os.getenv("DB_HOST", "localhost"),
+        "PORT": os.getenv("DB_PORT", "5432"),
+    },
+}
 
-# Use conn_max_age=0 temporarily to avoid stale SSL connections reused across requests
-db_conf = dj_database_url.parse(_db_url, conn_max_age=0, ssl_require=True)
-
-# Ensure explicit options so connect timeout and sslmode are set
-db_conf.setdefault("OPTIONS", {})
-# Preserve any channel_binding param already provided in the URL by dj_database_url;
-# add connect_timeout and ensure sslmode is explicitly present.
-db_conf["OPTIONS"].update({
-    "connect_timeout": 10,   # fail fast on network issues
-    "sslmode": db_conf["OPTIONS"].get("sslmode", "require"),
-})
-
-DATABASES = {"default": db_conf}
 
 AI_SETTINGS = {
     'GROQ_API_KEY': os.getenv('GROQ_API_KEY', ''),

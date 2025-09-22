@@ -2,7 +2,7 @@
 
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import CreateTenantView, LoginView, LogoutView, GetCSRFTokenView
+from .views import CreateTenantView, LoginView, LogoutView, GetCSRFTokenView, PurchaseOrderViewSet
 from . import views, business_views
 from .business_views import *  # Import from business_views
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
@@ -20,6 +20,7 @@ router.register(r'cost-centers', views.CostCenterViewSet, basename='cost-centers
 router.register(r'parties', views.PartyViewSet, basename='parties')
 router.register(r'warehouses', views.WarehouseViewSet, basename='warehouses')
 router.register(r'chart-of-accounts', views.ChartOfAccountsViewSet, basename='chart-of-accounts')
+router.register(r'purchase-orders', PurchaseOrderViewSet)
 
 urlpatterns = [
     path("create-tenant/", CreateTenantView.as_view(), name="create-tenant"),

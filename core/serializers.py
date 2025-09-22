@@ -8,8 +8,9 @@ from django.contrib.auth import authenticate
 from .models import (
     Tenant, TenantUser, Product, WorkOrder, ProductionEntry, 
     Equipment, Employee, StockMovement, ChartOfAccounts,
-    GLJournal, GLJournalLine, CostCenter, Warehouse, Party
+    GLJournal, GLJournalLine, CostCenter, Warehouse, Party, PurchaseOrder, PurchaseOrderLine
 )
+from django.utils import timezone
 
 # ===== AUTHENTICATION SERIALIZERS =====
 
@@ -90,7 +91,7 @@ class LoginSerializer(serializers.Serializer):
             except (Tenant.DoesNotExist, TenantUser.DoesNotExist):
                 raise serializers.ValidationError("User not authorized for this tenant")
         
-        attrs['user'] = user
+        attrs['user'] = user    
         return attrs
 
 # ===== MASTER DATA SERIALIZERS =====
@@ -700,3 +701,94 @@ class AlertSerializer(serializers.Serializer):
     reference = serializers.CharField()
     timestamp = serializers.DateTimeField()
     acknowledged = serializers.BooleanField(default=False)
+
+class PurchaseOrderLineSerializer(serializers.ModelSerializer):
+    product = serializers.CharField()  # Change to CharField to accept SKU instead of ID
+
+    class Meta:
+        model = PurchaseOrderLine
+        fields = ['line_number', 'product', 'quantity', 'unit_price', 'subtotal']
+        read_only_fields = ['subtotal']
+
+    def validate_product(self, value):
+        # Resolve SKU to Product instance
+        tenant = self.context['request'].tenant
+        try:
+            return Product.objects.get(tenant=tenant, sku=value)
+        except Product.DoesNotExist:
+            raise serializers.ValidationError("Product with this SKU does not exist.")
+
+    def validate(self, data):
+        if not data.get('product'):
+            raise serializers.ValidationError({"product": "This field is required."})
+        return data
+
+class PurchaseOrderSerializer(serializers.ModelSerializer):
+    lines = PurchaseOrderLineSerializer(many=True, required=False)
+    supplier = serializers.CharField()  # Optional: Allow supplier code instead of ID
+
+    class Meta:
+        model = PurchaseOrder
+        fields = '__all__'
+        read_only_fields = ['tenant', 'created_by', 'po_number', 'amount']
+
+    def validate_supplier(self, value):
+        # Resolve supplier code to Party instance
+        tenant = self.context['request'].tenant
+        try:
+            return Party.objects.get(tenant=tenant, party_code=value, party_type='supplier')
+        except Party.DoesNotExist:
+            raise serializers.ValidationError("Supplier with this code does not exist.")
+
+    def create(self, validated_data):
+        lines_data = validated_data.pop('lines', [])
+        tenant = self.context['request'].tenant
+        user = self.context['request'].user
+        
+        # Auto-generate PO number
+        last_po = PurchaseOrder.objects.filter(tenant=tenant).order_by('-id').first()
+        po_number = f"PO-{timezone.now().strftime('%Y%m')}-{(last_po.id + 1) if last_po else 1:04d}"
+        validated_data['po_number'] = po_number
+        
+        # Create the PurchaseOrder
+        po = PurchaseOrder.objects.create(tenant=tenant, created_by=user, **validated_data)
+        
+        # Create lines and calculate amount
+        amount = Decimal('0.00')
+        for line_data in lines_data:
+            line_data.pop('purchase_order', None)
+            line = PurchaseOrderLine.objects.create(
+                tenant=tenant,
+                created_by=user,
+                purchase_order=po,
+                **line_data
+            )
+            amount += line.subtotal
+        
+        po.amount = amount
+        po.save()
+        
+        return po
+    
+    def update(self, instance, validated_data):
+        lines_data = validated_data.pop('lines', None)
+        instance = super().update(instance, validated_data)
+        
+        if lines_data is not None:
+            instance.lines.all().delete()
+            amount = Decimal('0.00')
+            
+            for line_data in lines_data:
+                line_data.pop('purchase_order', None)
+                line = PurchaseOrderLine.objects.create(
+                    tenant=instance.tenant,
+                    created_by=self.context['request'].user,
+                    purchase_order=instance,
+                    **line_data
+                )
+                amount += line.subtotal
+            
+            instance.amount = amount
+            instance.save()
+        
+        return instance

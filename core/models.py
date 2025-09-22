@@ -4,6 +4,7 @@ from django.db import models
 from django.contrib.auth.models import User
 from django.core.validators import MinValueValidator
 import json
+from django.utils import timezone 
 
 # ===== TENANT MANAGEMENT =====
 class Tenant(models.Model):
@@ -19,6 +20,8 @@ class Tenant(models.Model):
     plan_type = models.CharField(max_length=20, choices=PLAN_CHOICES, default='basic')
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    gstin = models.CharField(max_length=15, blank=True)
+    company_address = models.TextField(blank=True, default="")  
     modules_enabled = models.JSONField(default=dict)  # {"production": True, "finance": True}
     
     def __str__(self):
@@ -348,3 +351,72 @@ class AutomationRule(BaseModel):
     
     def __str__(self):
         return self.rule_name
+
+class TenantEmailConfig(BaseModel):
+    """Stores email preferences for weekly reports per tenant"""
+    tenant = models.ForeignKey('Tenant', on_delete=models.CASCADE, related_name='email_configs')
+    weekly_report_enabled = models.BooleanField(default=True)
+    recipients = models.JSONField(default=list)  # e.g., ["owner@company.com"]
+    send_day = models.CharField(max_length=10, default='sunday', choices=[('monday', 'Monday'), ('sunday', 'Sunday')])
+    send_time = models.TimeField(default='08:00:00')
+    
+    class Meta:
+        unique_together = ['tenant']
+
+
+class PurchaseOrder(BaseModel):
+    """Purchase Order management - optional for tracking supplier orders with simple amount"""
+    STATUS_CHOICES = [
+        ('draft', 'Draft'),
+        ('sent', 'Sent'),
+        ('received', 'Received'),
+        ('cancelled', 'Cancelled')
+    ]
+    
+    po_number = models.CharField(max_length=30)
+    supplier = models.ForeignKey(
+        Party, 
+        on_delete=models.CASCADE, 
+        limit_choices_to={'party_type': 'supplier'},
+        related_name='purchase_orders'
+    )
+    order_date = models.DateField(default=timezone.now)
+    expected_delivery = models.DateField(null=True, blank=True)
+    delivery_address = models.TextField(blank=True)  # Optional: use tenant's address by default
+    terms_conditions = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)  # Simple amount field
+    
+    class Meta:
+        unique_together = ['tenant', 'po_number']
+        ordering = ['-order_date']
+    
+    def __str__(self):
+        return f"{self.po_number} - {self.supplier.display_name}"
+    
+    def save(self, *args, **kwargs):
+        # Auto-calculate amount from lines
+        if self.pk:  # Only on update
+            self.amount = sum(line.subtotal for line in self.lines.all())
+        super().save(*args, **kwargs)
+
+class PurchaseOrderLine(BaseModel):
+    """Line items for Purchase Orders"""
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, 
+        on_delete=models.CASCADE, 
+        related_name='lines'
+    )
+    line_number = models.IntegerField()
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.DecimalField(max_digits=12, decimal_places=3)
+    unit_price = models.DecimalField(max_digits=12, decimal_places=2)
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2)
+    
+    class Meta:
+        unique_together = ['purchase_order', 'line_number']
+        ordering = ['line_number']
+    
+    def save(self, *args, **kwargs):
+        self.subtotal = self.quantity * self.unit_price
+        super().save(*args, **kwargs)

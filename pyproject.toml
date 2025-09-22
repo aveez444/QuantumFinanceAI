@@ -3,7 +3,11 @@ name = "quantumfinanceai"
 version = "0.1.0"
 description = "Quantum Finance AI"
 authors = ["Your Name <your@email.com>"]
-package-mode = false
+packages = [{include = "quantumfinanceai"}]
+include = [
+    "README.md",
+    "requirements.txt",
+]
 
 [tool.poetry.dependencies]
 python = "^3.11"
@@ -21,6 +25,16 @@ gunicorn = "22.0.0"
 whitenoise = "6.6.0"
 setuptools = "70.0.0"
 dj-database-url = "2.1.0"
+matplotlib = "3.8.0"
+reportlab = "4.0.4"
+celery = "5.3.4"
+redis = "5.0.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-django = "^4.5.2"
+black = "^23.0.0"
+flake8 = "^6.0.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

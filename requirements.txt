@@ -3,7 +3,7 @@ djangorestframework==3.15.2
 django-cors-headers==4.4.0
 django-filter==24.3
 djangorestframework-simplejwt==5.4.0
-psycopg2-binary==2.9.9  # Stable version that works
+psycopg==3.2.10
 python-dotenv==1.0.0
 groq==0.3.0
 openai==1.30.5
@@ -12,3 +12,7 @@ gunicorn==22.0.0
 whitenoise==6.6.0
 setuptools==70.0.0
 dj-database-url==2.1.0
+matplotlib==3.8.0
+reportlab==4.0.4
+celery==5.3.4
+redis==5.0.1

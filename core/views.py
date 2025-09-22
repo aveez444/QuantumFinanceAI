@@ -4,7 +4,7 @@ from rest_framework.decorators import api_view, action, permission_classes
 from rest_framework import status, permissions, generics, viewsets, filters
 from django.contrib.auth import login, logout  
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from .serializers import TenantWithAdminSerializer, WarehouseSerializer, ChartOfAccountsSerializer, LoginSerializer, ProductSerializer, WorkOrderSerializer, ProductionEntrySerializer, EquipmentSerializer, EmployeeSerializer, StockMovementSerializer, GLJournalSerializer, CostCenterSerializer, PartySerializer
+from .serializers import TenantWithAdminSerializer, WarehouseSerializer, PurchaseOrderSerializer, ChartOfAccountsSerializer, LoginSerializer, ProductSerializer, WorkOrderSerializer, ProductionEntrySerializer, EquipmentSerializer, EmployeeSerializer, StockMovementSerializer, GLJournalSerializer, CostCenterSerializer, PartySerializer
 from django.core.cache import cache
 from django.db.models import Sum, Avg, Count, Q, F, Case, When, DecimalField, Max
 from typing import Dict, List, Any, Optional
@@ -14,6 +14,15 @@ from django.shortcuts import get_object_or_404
 from datetime import datetime, timedelta
 from decimal import Decimal
 from django.middleware.csrf import get_token
+
+from django.http import HttpResponse
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+from reportlab.lib import colors
+import io
 
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -35,7 +44,7 @@ from .enhanced_ai_engine import ERPAIEngine
 from .models import (
     Tenant, TenantUser, Product, WorkOrder, ProductionEntry, 
     Equipment, Employee, StockMovement, ChartOfAccounts, 
-    GLJournal, GLJournalLine, CostCenter, Warehouse, Party
+    GLJournal, GLJournalLine, CostCenter, Warehouse, Party, PurchaseOrder
 )
 
 
@@ -217,6 +226,99 @@ class ProductViewSet(viewsets.ModelViewSet):
             'total_products': len(stock_data),
             'reorder_needed': sum(1 for p in stock_data if p['needs_reorder'])
         })
+
+    @action(detail=False, methods=['get'], url_path='stock-report')
+    def stock_report(self, request):
+        tenant = get_current_tenant()
+        products = Product.objects.filter(tenant=tenant, is_active=True)
+        
+        data = []
+        for p in products:
+            # Calculate current stock
+            movements = StockMovement.objects.filter(tenant=tenant, product=p)
+            current_stock = movements.aggregate(total=Sum('quantity'))['total'] or 0
+            
+            # Warehouse breakdown
+            warehouse_stocks = movements.values('warehouse__warehouse_name').annotate(stock=Sum('quantity')).order_by('warehouse__warehouse_name')
+            breakdown = [
+                {'warehouse': ws['warehouse__warehouse_name'], 'stock': float(ws['stock'] or 0)}
+                for ws in warehouse_stocks if ws['stock'] != 0
+            ]
+            
+            # Last movement
+            last_movement = movements.order_by('-movement_date').first()
+            
+            data.append({
+                'sku': p.sku,
+                'product_name': p.product_name,
+                'current_stock': float(current_stock),
+                'reorder_point': p.reorder_point,
+                'standard_cost': float(p.standard_cost),
+                'stock_value': float(current_stock * p.standard_cost),
+                'last_movement_date': last_movement.movement_date if last_movement else None,
+                'warehouse_breakdown': breakdown
+            })
+        
+        return Response({
+            'report_date': timezone.now().date(),
+            'total_value': sum(d['stock_value'] for d in data),
+            'total_items': len(data),
+            'data': data
+        })
+
+    @action(detail=False, methods=['get'], url_path='stock-report-pdf')
+    def stock_report_pdf(self, request):
+        tenant = get_current_tenant()
+        products = Product.objects.filter(tenant=tenant, is_active=True)
+        
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        # Header
+        elements.append(Paragraph(tenant.company_name, styles['Heading1']))
+        elements.append(Paragraph("Stock Report", styles['Heading2']))
+        elements.append(Paragraph(f"Generated on: {timezone.now().date()}", styles['Normal']))
+        elements.append(Paragraph("", styles['Normal']))  # Spacer
+        
+        # Table data
+        data = [['SKU', 'Product Name', 'Stock', 'Value', 'Reorder Point']]
+        total_value = 0
+        for p in products:
+            current_stock = StockMovement.objects.filter(tenant=tenant, product=p).aggregate(total=Sum('quantity'))['total'] or 0
+            value = current_stock * p.standard_cost
+            total_value += value
+            data.append([
+                p.sku,
+                p.product_name,
+                f"{current_stock}",
+                f"${value:.2f}",
+                str(p.reorder_point)
+            ])
+        
+        table = Table(data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        elements.append(table)
+        
+        # Footer
+        elements.append(Paragraph("", styles['Normal']))  # Spacer
+        elements.append(Paragraph(f"Total Stock Value: ${total_value:.2f}", styles['Heading3']))
+        
+        doc.build(elements)
+        buffer.seek(0)
+        
+        response = HttpResponse(buffer, content_type='application/pdf')
+        response['Content-Disposition'] = 'attachment; filename="stock_report.pdf"'
+        return response
 
 class PartyViewSet(viewsets.ModelViewSet):
     """Customer/Supplier master data"""
@@ -1726,3 +1828,234 @@ class AIQueryView(APIView):
         
         return total_rows
         
+class PurchaseOrderViewSet(viewsets.ModelViewSet):
+    """Purchase Order management - optional for supplier orders with simple amount"""
+    serializer_class = PurchaseOrderSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['po_number', 'supplier__display_name']
+    ordering_fields = ['po_number', 'order_date', 'status']
+    ordering = ['-order_date']
+    
+    # Add this line to fix the basename error
+    queryset = PurchaseOrder.objects.all()  # Will be filtered by tenant in get_queryset
+    
+    def get_queryset(self):
+        tenant = get_current_tenant()
+        return PurchaseOrder.objects.filter(tenant=tenant, is_active=True) if tenant else PurchaseOrder.objects.none()
+    
+    def perform_create(self, serializer):
+        serializer.save()
+    
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context
+    
+    @action(detail=True, methods=['post'])
+    def send(self, request, pk=None):
+        """Mark PO as sent to supplier"""
+        po = self.get_object()
+        if po.status != 'draft':
+            return Response({'error': 'Only draft POs can be sent'}, status=400)
+        
+        po.status = 'sent'
+        po.save()
+        
+        return Response({'message': 'PO marked as sent', 'status': po.status})
+    
+    @action(detail=True, methods=['post'])
+    def receive(self, request, pk=None):
+        """Mark PO as received and create stock receipts"""
+        po = self.get_object()
+        if po.status != 'sent':
+            return Response({'error': 'Only sent POs can be received'}, status=400)
+        
+        warehouse = Warehouse.objects.filter(tenant=po.tenant).first()
+        if not warehouse:
+            return Response({'error': 'No warehouse found for receipts'}, status=400)
+        
+        with transaction.atomic():
+            po.status = 'received'
+            po.save()
+            
+            for line in po.lines.all():
+                StockMovement.objects.create(
+                    tenant=po.tenant,
+                    movement_number=generate_movement_number(po.tenant, 'PO-RECV'),
+                    movement_type='receipt',
+                    product=line.product,
+                    warehouse=warehouse,
+                    quantity=line.quantity,
+                    unit_cost=line.unit_price,
+                    reference_doc=po.po_number,
+                    movement_date=timezone.now(),
+                    created_by=request.user
+                )
+            
+            if po.tenant.modules_enabled.get('finance'):
+                create_automated_gl_entry(
+                    po.tenant,
+                    'purchase_receipt',
+                    {'purchase_order_id': po.id},
+                    user=request.user
+                )
+        
+        for line in po.lines.all():
+            cache.delete(f"stock_{po.tenant.id}_{line.product.id}")
+        
+        return Response({'message': 'PO received and stock updated', 'status': po.status})
+    
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel PO if not received"""
+        po = self.get_object()
+        if po.status in ['received', 'cancelled']:
+            return Response({'error': 'Cannot cancel received or already cancelled PO'}, status=400)
+        
+        po.status = 'cancelled'
+        po.save()
+        
+        return Response({'message': 'PO cancelled', 'status': po.status})
+        
+    @action(detail=True, methods=['get'])
+    def download_pdf(self, request, pk=None):
+        """Generate and download PO as PDF with enhanced UI"""
+        po = self.get_object()
+        tenant = po.tenant
+        
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            topMargin=0.5*inch,
+            bottomMargin=0.5*inch,
+            leftMargin=0.5*inch,
+            rightMargin=0.5*inch
+        )
+        elements = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles with unique names to avoid conflicts
+        if 'CustomCompanyHeader' not in styles:
+            styles.add(ParagraphStyle(
+                name='CustomCompanyHeader',
+                fontName='Helvetica-Bold',
+                fontSize=16,
+                textColor=colors.HexColor('#9333EA'),  # Purple from StockReports.jsx
+                spaceAfter=6
+            ))
+        if 'CustomSubHeader' not in styles:
+            styles.add(ParagraphStyle(
+                name='CustomSubHeader',
+                fontName='Helvetica',
+                fontSize=10,
+                textColor=colors.HexColor('#6B7280'),  # Gray-400
+                spaceAfter=4
+            ))
+        if 'CustomBodyText' not in styles:
+            styles.add(ParagraphStyle(
+                name='CustomBodyText',
+                fontName='Helvetica',
+                fontSize=10,
+                textColor=colors.black,
+                spaceAfter=4
+            ))
+        if 'CustomSectionTitle' not in styles:
+            styles.add(ParagraphStyle(
+                name='CustomSectionTitle',
+                fontName='Helvetica-Bold',
+                fontSize=12,
+                textColor=colors.HexColor('#2563EB'),  # Blue-600
+                spaceBefore=12,
+                spaceAfter=6
+            ))
+
+        # Header
+        elements.append(Paragraph(tenant.company_name, styles['CustomCompanyHeader']))
+        elements.append(Paragraph(tenant.company_address or "Address not specified", styles['CustomSubHeader']))
+        elements.append(Paragraph(f"GSTIN: {tenant.gstin or 'N/A'}", styles['CustomSubHeader']))
+        elements.append(Spacer(1, 0.25*inch))
+        
+        # PO Title and Details
+        elements.append(Paragraph("Purchase Order", styles['CustomSectionTitle']))
+        elements.append(Paragraph(f"PO Number: {po.po_number}", styles['CustomBodyText']))
+        elements.append(Paragraph(f"Date: {po.order_date}", styles['CustomBodyText']))
+        elements.append(Paragraph(f"Expected Delivery: {po.expected_delivery or 'N/A'}", styles['CustomBodyText']))
+        elements.append(Spacer(1, 0.25*inch))
+        
+        # Supplier Details
+        elements.append(Paragraph("Supplier Details", styles['CustomSectionTitle']))
+        elements.append(Paragraph(po.supplier.display_name, styles['CustomBodyText']))
+        elements.append(Paragraph(f"GSTIN: {po.supplier.gstin or 'N/A'}", styles['CustomBodyText']))
+
+        # Handle contact_details safely
+        address = "N/A"
+        try:
+            if isinstance(po.supplier.contact_details, dict):
+                address = po.supplier.contact_details.get('address', 'N/A')
+            elif isinstance(po.supplier.contact_details, str):
+                try:
+                    contact_details = json.loads(po.supplier.contact_details)
+                    address = contact_details.get('address', 'N/A')
+                except json.JSONDecodeError:
+                    address = po.supplier.contact_details
+            logger.info(f"contact_details: {po.supplier.contact_details}, type: {type(po.supplier.contact_details)}, parsed address: {address}")
+        except Exception as e:
+            logger.error(f"Error processing contact_details for supplier {po.supplier.id}: {str(e)}")
+        
+        elements.append(Paragraph(f"Address: {address}", styles['CustomBodyText']))
+        elements.append(Spacer(1, 0.25*inch))
+        
+        # Items Table
+        data = [['Line', 'Product', 'Quantity', 'Unit Price', 'Subtotal']]
+        for line in po.lines.all():
+            data.append([
+                str(line.line_number),
+                line.product.product_name,
+                f"{line.quantity} {line.product.uom}",
+                f"{line.unit_price:.2f}",
+                f"{line.subtotal:.2f}"
+            ])
+        
+        table = Table(data, colWidths=[0.5*inch, 2.5*inch, 1*inch, 1*inch, 1*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#9333EA')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F3F4F6')),
+            ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#D1D5DB')),
+            ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#6B7280')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.HexColor('#F3F4F6'), colors.HexColor('#E5E7EB')]),
+        ]))
+        elements.append(table)
+        
+        # Total Amount
+        elements.append(Spacer(1, 0.25*inch))
+        elements.append(Paragraph(f"Total Amount: {po.amount:.2f}", styles['CustomSectionTitle']))
+        
+        # Terms & Conditions
+        if po.terms_conditions:
+            elements.append(Paragraph("Terms & Conditions", styles['CustomSectionTitle']))
+            elements.append(Paragraph(po.terms_conditions, styles['CustomBodyText']))
+        
+        # Footer
+        def add_footer(canvas, doc):
+            canvas.saveState()
+            canvas.setFont('Helvetica', 8)
+            canvas.setFillColor(colors.HexColor('#6B7280'))
+            canvas.drawString(0.5*inch, 0.3*inch, f"{tenant.company_name} | Page {doc.page}")
+            canvas.restoreState()
+        
+        doc.build(elements, onFirstPage=add_footer, onLaterPages=add_footer)
+        buffer.seek(0)
+        
+        response = HttpResponse(buffer, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="PO_{po.po_number}.pdf"'
+        return response
