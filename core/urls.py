@@ -21,6 +21,10 @@ router.register(r'parties', views.PartyViewSet, basename='parties')
 router.register(r'warehouses', views.WarehouseViewSet, basename='warehouses')
 router.register(r'chart-of-accounts', views.ChartOfAccountsViewSet, basename='chart-of-accounts')
 router.register(r'purchase-orders', PurchaseOrderViewSet)
+router.register(r'employee-documents', views.EmployeeDocumentViewSet, basename='employee-documents')
+router.register(r'customer-invoices', views.CustomerInvoiceViewSet, basename='customer-invoices')
+router.register(r'customer-pos', views.CustomerPurchaseOrderViewSet, basename='customer-pos')
+router.register(r'payment-advices', views.PaymentAdviceViewSet, basename='payment-advices')
 
 urlpatterns = [
     path("create-tenant/", CreateTenantView.as_view(), name="create-tenant"),
@@ -56,7 +60,17 @@ urlpatterns = [
     
     # Include ViewSet URLs
     path('api/', include(router.urls)),
-    
+
+    # OCR and Reconciliation endpoints
+    path('reconcile/payment-advice/', views.PaymentAdviceReconcileView.as_view(), name='reconcile-payment-advice'),
+    path('reconcile/confirm/', views.ReconciliationConfirmView.as_view(), name='reconcile-confirm'),
+    path('customers/<int:customer_id>/unpaid-invoices/', views.customer_unpaid_invoices, name='customer-unpaid-invoices'),
+    # In business_patterns or main urlpatterns
+    path('reconciliation/dashboard-data/', views.reconciliation_dashboard_data, name='reconciliation-dashboard-data'),
+    path('reconcile/invoice-numbers/', views.reconcile_invoice_numbers, name='reconcile-invoice-numbers'),
+    path('save-reconciliation/', views.save_reconciliation, name='save-reconciliation'),
+
+
     # Add the warehouse-stock endpoint explicitly
     path('stock-movements/warehouse-stock/', views.StockMovementViewSet.as_view({'get': 'warehouse_stock'}), name='warehouse-stock'),
 ]
@@ -96,6 +110,7 @@ business_patterns = [
     path('business-overview/', business_views.business_overview_dashboard, name='business-overview-dashboard'),
     # In urls.py - business_patterns
     path('operations/overdue-work-orders/', overdue_work_orders, name='overdue-work-orders'),
+
 ]
 
 urlpatterns.extend(business_patterns)

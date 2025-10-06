@@ -2,11 +2,22 @@
 
 from django.db.models import Sum, Avg, Q
 from django.utils import timezone
+from django.core.cache import cache  # Add this import
 from datetime import datetime, timedelta
 from decimal import Decimal
-from .models import GLJournal, GLJournalLine, ChartOfAccounts, WorkOrder
+from .models import GLJournal, GLJournalLine, ChartOfAccounts, WorkOrder, ProductionEntry, StockMovement, GLJournalArchive, GLJournalLineArchive
 import logging
 from .llm_utils import call_llm
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from io import BytesIO
+from datetime import timedelta
+from django.utils import timezone
+import matplotlib.pyplot as plt  # Add this import
+import matplotlib  # Add this import
+matplotlib.use('Agg')
 
 logger = logging.getLogger(__name__)
 
@@ -773,57 +784,140 @@ def get_dashboard_alerts(tenant):
     
     return alerts
 
-    # Placeholder for LLM API - replace with e.g., openai.ChatCompletion.create or xai equivalent
-def call_llm(prompt):
-    # TODO: Implement actual LLM call here
-    # For testing, return a mock classification/response
-    return "Mock LLM response: Classified as system-specific DB query."
-
-# logger = logging.getLogger(__name__)
-
-# def process_ai_query(tenant, user, query):
-#     """
-#     Core AI processing: Auto-detect intent, handle DB/API, generate response.
-#     Optimizes for professional DB queries (efficient ORM for simple/complex cases).
-#     """
-#     # Step 1: Intent detection via LLM
-#     intent_prompt = f"""
-#     Analyze this user query: '{query}'.
-#     Classify as:
-#     - 'db_query': For direct data fetch (e.g., 'x product sales' -> suggest ORM like Product.objects.filter(...)).
-#     - 'api_call': For analytics (e.g., 'production anomalies' -> call detect_production_anomalies).
-#     - 'general': Pure knowledge (e.g., 'Taj Mahal location').
-#     - 'hybrid': Mix (e.g., explain data with tips).
-#     Suggest handling: For db_query, provide executable Django ORM code snippet.
-#     For api_call, name the util/view to call.
-#     Be precise, efficient, and insightful.
-#     """
-#     intent_response = call_llm(intent_prompt)
-#     # Parse intent (in real LLM, extract from response; mock for now)
-#     classification = 'db_query'  # Example parse
-
-#     # Step 2: Handle based on classification
-#     data = None
-#     if classification == 'db_query':
-#         # Generate and execute professional ORM query
-#         # LLM suggests code like: "data = ProductionEntry.objects.filter(tenant=tenant, product__sku='X').aggregate(total_sales=Sum('quantity_produced'))"
-#         orm_code = "data = Product.objects.filter(tenant=tenant, is_active=True).count()"  # LLM-generated example
-#         try:
-#             local_vars = {'tenant': tenant, 'user': user, **globals()}  # Safe env with models
-#             exec(orm_code, local_vars)  # Execute in restricted scope (add safeguards like no __builtins__ overrides)
-#             data = local_vars.get('data')
-#         except Exception as e:
-#             raise ValueError(f"DB query error: {e}")
+def generate_weekly_report_pdf(tenant, start_date, end_date):
+    """Generate PDF with structured manufacturing data for the week"""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    elements = []
     
-#     elif classification == 'api_call':
-#         # Call your utils/views, e.g., detect_production_anomalies(tenant)
-#         data = detect_production_anomalies(tenant)  # Dynamic based on LLM suggestion
+    # Header
+    elements.append(Paragraph(f"Weekly Report: {tenant.company_name} ({start_date} to {end_date})", styles['Title']))
     
-#     elif classification == 'hybrid' or classification == 'general':
-#         # Direct LLM for explanation/tips
-#         data = call_llm(f"Answer: '{query}'. Use knowledge for insights.")
+    # Production Summary
+    production_data = ProductionEntry.objects.filter(
+        tenant=tenant, entry_datetime__date__range=[start_date, end_date]
+    ).aggregate(
+        total_produced=Sum('quantity_produced'),
+        total_rejected=Sum('quantity_rejected'),
+        total_downtime=Sum('downtime_minutes')
+    )
+    total_produced = production_data['total_produced'] or 0
+    total_rejected = production_data['total_rejected'] or 0
+    quality_rate = (total_produced - total_rejected) / total_produced * 100 if total_produced else 0
+    
+    prod_table = Table([
+        ['Metric', 'Value'],
+        ['Total Produced', f"{total_produced} units"],
+        ['Total Rejected', f"{total_rejected} units"],
+        ['Quality Rate', f"{quality_rate:.1f}%"],
+        ['Total Downtime', f"{production_data['total_downtime'] or 0} min"]
+    ])
+    prod_table.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 1, colors.black),
+        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+        ('FONTSIZE', (0,0), (-1,-1), 10)
+    ]))
+    elements.append(Paragraph("Production Summary", styles['Heading2']))
+    elements.append(prod_table)
+    
+    # OEE Chart
+    oee_data = cache.get(f"oee_metrics_{tenant.id}_{end_date}", {})
+    plt.figure(figsize=(4, 2))
+    plt.bar(['OEE', 'Availability', 'Performance', 'Quality'], 
+            [oee_data.get('oee', 0), oee_data.get('availability', 0), 
+             oee_data.get('performance', 0), oee_data.get('quality', 0)])
+    plt.tight_layout()
+    chart_buffer = BytesIO()
+    plt.savefig(chart_buffer, format='png')
+    plt.close()
+    chart_buffer.seek(0)
+    elements.append(Paragraph("OEE Metrics", styles['Heading2']))
+    elements.append(Image(chart_buffer, width=200, height=100))
+    
+    # Inventory Summary
+    stock_data = StockMovement.objects.filter(
+        tenant=tenant, movement_date__date__range=[start_date, end_date]
+    ).values('product__sku').annotate(total=Sum('quantity'))
+    stock_table = Table([['SKU', 'Current Stock']] + 
+                       [[item['product__sku'], f"{item['total']:.2f}"] for item in stock_data[:5]])
+    stock_table.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 1, colors.black)]))
+    elements.append(Paragraph("Inventory (Top 5)", styles['Heading2']))
+    elements.append(stock_table)
+    
+    # Alerts
+    alerts = cache.get(f"business_alerts_{tenant.id}_{end_date}", [])
+    alert_table = Table([['Alert', 'Details']] + 
+                       [[a['type'], a['message']] for a in alerts[:3]])
+    alert_table.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 1, colors.black)]))
+    elements.append(Paragraph("Recent Alerts", styles['Heading2']))
+    elements.append(alert_table)
+    
+    # Build PDF
+    doc.build(elements)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
 
-#     # Step 3: Generate final response via LLM (format with tables, recommendations)
-#     response_prompt = f"Based on data: {data}. Respond to '{query}' insightfully. Use tables for data, add recommendations."
-#     final_response = call_llm(response_prompt)
-#     return final_response
+
+def archive_and_clean_gl_journals(age_days=2555):  # ~7 years
+    """Archive posted journals and hard-delete old inactive records"""
+    cutoff_date = timezone.now().date() - timedelta(days=age_days)
+    
+    # Archive posted journals older than cutoff
+    journals_to_archive = GLJournal.objects.filter(
+        is_active=True,
+        status='posted',
+        posting_date__lt=cutoff_date
+    )
+    
+    for journal in journals_to_archive:
+        try:
+            # Create archive record
+            archive_journal = GLJournalArchive.objects.create(
+                tenant=journal.tenant,
+                journal_number=journal.journal_number,
+                posting_date=journal.posting_date,
+                reference=journal.reference,
+                narration=journal.narration,
+                total_debit=journal.total_debit,
+                total_credit=journal.total_credit,
+                status=journal.status,
+                original_id=journal.id
+            )
+            
+            # Archive lines
+            for line in journal.lines.all():
+                GLJournalLineArchive.objects.create(
+                    tenant=journal.tenant,
+                    journal=archive_journal,
+                    line_number=line.line_number,
+                    account_code=line.account.account_code,
+                    cost_center_code=line.cost_center.cost_center_code if line.cost_center else '',
+                    debit_amount=line.debit_amount,
+                    credit_amount=line.credit_amount,
+                    description=line.description,
+                    original_id=line.id
+                )
+            
+            # Soft-delete original
+            journal.is_active = False
+            journal.save()
+            GLJournalLine.objects.filter(journal=journal).update(is_active=False)
+            logger.info(f"Archived journal {journal.journal_number}")
+            
+        except Exception as e:
+            logger.error(f"Failed to archive journal {journal.journal_number}: {str(e)}")
+    
+    # Hard-delete inactive non-posted journals older than cutoff
+    inactive_journals = GLJournal.objects.filter(
+        is_active=False,
+        status__in=['draft', 'cancelled'],
+        updated_at__lt=cutoff_date
+    )
+    for journal in inactive_journals:
+        try:
+            journal.delete()  # Hard delete
+            logger.info(f"Hard-deleted journal {journal.journal_number}")
+        except Exception as e:
+            logger.error(f"Failed to delete journal {journal.journal_number}: {str(e)}")

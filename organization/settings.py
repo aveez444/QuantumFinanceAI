@@ -4,8 +4,8 @@ from pathlib import Path
 import os
 from dotenv import load_dotenv
 from datetime import timedelta
-import dj_database_url
-
+from decouple import config
+from celery.schedules import crontab
 
 load_dotenv()
 
@@ -21,7 +21,6 @@ DEBUG = os.getenv("DEBUG", "False").lower() in ("1", "true", "yes")
 
 
 ALLOWED_HOSTS = ["quantumfinanceai.onrender.com"]
-
 
 
 # Application definition
@@ -270,3 +269,89 @@ LOGGING = {
 
 os.makedirs(BASE_DIR / 'logs', exist_ok=True)
 
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/5.1/howto/static-files/
+
+STATIC_URL = 'static/'
+
+# Default primary key field type
+# https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
+
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+CELERY_BEAT_SCHEDULE = {
+    'send-weekly-reports': {
+        'task': 'core.tasks.send_weekly_reports',
+        'schedule': crontab(day_of_week='sunday', hour=8, minute=0),
+    },
+}
+
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.gmail.com'
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'foodoindia@gmail.com'
+EMAIL_HOST_PASSWORD = 'ewck ezsv sdpj thdk'
+EMAIL_USE_TLS = True
+DEFAULT_FROM_EMAIL = 'noreply@yourerp.com'
+
+# AWS S3 Configuration
+AWS_ACCESS_KEY_ID = config('AWS_ACCESS_KEY_ID', default='')
+AWS_SECRET_ACCESS_KEY = config('AWS_SECRET_ACCESS_KEY', default='')
+AWS_STORAGE_BUCKET_NAME = config('AWS_STORAGE_BUCKET_NAME', default='your-erp-bucket')
+AWS_S3_REGION_NAME = config('AWS_S3_REGION_NAME', default='us-east-1')
+
+# S3 Settings
+AWS_S3_CUSTOM_DOMAIN = f'{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com'
+AWS_DEFAULT_ACL = None
+AWS_S3_OBJECT_PARAMETERS = {
+    'CacheControl': 'max-age=86400',  # 1 day cache
+}
+
+# Security Settings
+AWS_S3_FILE_OVERWRITE = False  # Don't overwrite files with same name
+AWS_S3_SECURE_URLS = True
+AWS_LOCATION = 'media'  # Folder in S3 bucket
+
+# File Upload Settings
+DEFAULT_FILE_STORAGE = 'storages.backends.s3boto3.S3Boto3Storage'
+STATICFILES_STORAGE = 'storages.backends.s3boto3.S3StaticStorage'  # Optional: for static files too
+
+# File Size Limits (in bytes)
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB in memory
+DATA_UPLOAD_MAX_MEMORY_SIZE = 50 * 1024 * 1024   # 50MB total
+
+# Allowed file types by category
+ALLOWED_DOCUMENT_EXTENSIONS = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'txt', 'csv']
+ALLOWED_IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp']
+ALLOWED_CAD_EXTENSIONS = ['dwg', 'dxf', 'step', 'iges', 'stl']
+ALLOWED_ARCHIVE_EXTENSIONS = ['zip', 'rar', '7z']
+
+# File storage paths
+MEDIA_URL = f'https://{AWS_S3_CUSTOM_DOMAIN}/media/'
+MEDIA_ROOT = '/media/'  # Not used with S3 but required
+
+# Alternative: Local development settings
+if config('USE_S3', default=True, cast=bool) is False:
+    DEFAULT_FILE_STORAGE = 'django.core.files.storage.FileSystemStorage'
+    MEDIA_URL = '/media/'
+    MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# Celery for background file processing (optional)
+CELERY_BROKER_URL = config('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = config('REDIS_URL', default='redis://localhost:6379/0')
+CELERY_BEAT_SCHEDULE = {
+    'cleanup-old-gl-journals': {
+        'task': 'your_app.tasks.cleanup_old_gl_journals',
+        'schedule': crontab(day_of_month=1, hour=2, minute=0),  # 1st of month, 2 AM
+    },
+}
+
+# File processing settings
+MAX_FILE_SIZE = {
+    'document': 25 * 1024 * 1024,    # 25MB for documents
+    'image': 10 * 1024 * 1024,       # 10MB for images
+    'cad_drawing': 100 * 1024 * 1024, # 100MB for CAD files
+    'archive': 50 * 1024 * 1024,     # 50MB for archives
+}

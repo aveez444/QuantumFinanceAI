@@ -4,7 +4,10 @@ from celery import shared_task
 from django.core.cache import cache
 from django.db.models import Sum, Avg, Q
 from django.utils import timezone
+from django.core.mail import EmailMessage
+from django.utils import timezone
 from datetime import datetime, timedelta
+from .utils import archive_and_clean_gl_journals
 import logging
 from .models import (
     Tenant, WorkOrder, ProductionEntry, StockMovement, 
@@ -357,3 +360,49 @@ def get_cost_analysis(tenant, date):
     """Get cost analysis for a specific date"""
     # Implementation for cost calculation
     return {'total_labor_cost': 15000.00}
+
+@shared_task
+def send_weekly_reports():
+    """Send weekly email with PDF report to tenant recipients"""
+    active_tenants = Tenant.objects.filter(is_active=True)
+    end_date = timezone.now().date()
+    start_date = end_date - timedelta(days=7)
+    
+    for tenant in active_tenants:
+        config = TenantEmailConfig.objects.filter(tenant=tenant, weekly_report_enabled=True).first()
+        if not config or not config.recipients:
+            continue
+        
+        # Generate summary for email body
+        production = ProductionEntry.objects.filter(
+            tenant=tenant, entry_datetime__date__range=[start_date, end_date]
+        ).aggregate(total=Sum('quantity_produced'))['total'] or 0
+        oee = cache.get(f"oee_metrics_{tenant.id}_{end_date}", {}).get('oee', 0)
+        alerts = len(cache.get(f"business_alerts_{tenant.id}_{end_date}", []))
+        email_body = (
+            f"Weekly Summary for {tenant.company_name} ({start_date} to {end_date})\n"
+            f"- Total Production: {production} units\n"
+            f"- Average OEE: {oee:.1f}%\n"
+            f"- Alerts Triggered: {alerts}\n"
+            f"See attached PDF for details."
+        )
+        
+        # Generate PDF
+        pdf = generate_weekly_report_pdf(tenant, start_date, end_date)
+        
+        # Send email with attachment
+        email = EmailMessage(
+            subject=f"Weekly Manufacturing Report - {tenant.company_name}",
+            body=email_body,
+            from_email='noreply@erp.com',
+            to=config.recipients
+        )
+        email.attach(f'weekly_report_{tenant.id}_{end_date}.pdf', pdf, 'application/pdf')
+        email.send()
+        logger.info(f"Sent weekly report to {tenant.company_name}")
+
+
+@shared_task
+def cleanup_old_gl_journals():
+    """Monthly cleanup of old GL Journals"""
+    archive_and_clean_gl_journals(age_days=2555)  # ~7 years

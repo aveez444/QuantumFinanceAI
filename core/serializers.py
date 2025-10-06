@@ -5,10 +5,13 @@ from django.contrib.auth.models import User
 from decimal import Decimal
 from django.db.models import Sum, F
 from django.contrib.auth import authenticate
+from .middleware import get_current_tenant
 from .models import (
-    Tenant, TenantUser, Product, WorkOrder, ProductionEntry, 
-    Equipment, Employee, StockMovement, ChartOfAccounts,
-    GLJournal, GLJournalLine, CostCenter, Warehouse, Party, PurchaseOrder, PurchaseOrderLine
+    Tenant, TenantUser, Product, ProductImage, WorkOrder, ProductionEntry, 
+    Equipment, Employee, EmployeeDocument, StockMovement, ChartOfAccounts,
+    GLJournal, GLJournalLine, CostCenter, Warehouse, Party, 
+    PurchaseOrder, PurchaseOrderLine, CustomerInvoice, 
+    CustomerPurchaseOrder, PaymentAdvice, PaymentAdviceInvoice
 )
 from django.utils import timezone
 
@@ -19,7 +22,7 @@ class TenantWithAdminSerializer(serializers.Serializer):
     company_name = serializers.CharField(max_length=200)
     subdomain = serializers.CharField(max_length=50)
     plan_type = serializers.ChoiceField(choices=['basic', 'professional', 'enterprise'], default='basic')
-
+    
     # First admin credentials
     username = serializers.CharField(max_length=150)
     email = serializers.EmailField()
@@ -106,7 +109,7 @@ class ProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = [
             'id', 'sku', 'product_name', 'product_type', 'uom', 
-            'category', 'standard_cost', 'reorder_point', 'specifications',
+            'category', 'standard_cost', 'reorder_point', 'specifications', 'primary_image',
             'current_stock', 'stock_value', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'current_stock', 'stock_value']
@@ -127,6 +130,22 @@ class ProductSerializer(serializers.ModelSerializer):
         standard_cost = obj.standard_cost if obj.standard_cost else Decimal('0')
         # Both are Decimal now, so multiplication works
         return current_stock * standard_cost
+
+class ProductImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductImage
+        fields = ['id', 'image', 'caption', 'display_order', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+class EmployeeDocumentSerializer(serializers.ModelSerializer):
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
+    
+    class Meta:
+        model = EmployeeDocument
+        fields = ['id', 'employee', 'employee_name', 'document_type', 'document_name', 
+                  'document_file', 'expiry_date', 'notes', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
 
 class PartySerializer(serializers.ModelSerializer):
     """Customer/Supplier master serializer"""
@@ -792,3 +811,173 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
             instance.save()
         
         return instance
+
+class CustomerInvoiceSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source='customer.display_name', read_only=True)
+    customer_display_name = serializers.CharField(source='customer.display_name', read_only=True)
+    document_url = serializers.SerializerMethodField(read_only=True)
+    reference_customer_po_number = serializers.CharField(source='reference_customer_po.po_number', read_only=True)
+    
+    # Add amount as a writeable field that maps to invoice_amount
+    amount = serializers.DecimalField(
+        max_digits=12, 
+        decimal_places=2, 
+        write_only=True, 
+        required=False
+    )
+
+    class Meta:
+        model = CustomerInvoice
+        fields = [
+            'id', 'invoice_number', 'customer', 'customer_name', 'customer_display_name',
+            'reference_customer_po', 'reference_customer_po_number', 'invoice_date',
+            'due_date', 'invoice_amount', 'amount', 'status', 'notes', 'invoice_document',
+            'document_url', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['tenant', 'created_by', 'invoice_amount']
+
+    def get_document_url(self, obj):
+        return obj.invoice_document.url if obj and obj.invoice_document else None
+
+    def validate_invoice_number(self, value):
+        tenant = get_current_tenant()
+        if not tenant:
+            raise serializers.ValidationError("No tenant context")
+        qs = CustomerInvoice.objects.filter(tenant=tenant, invoice_number=value)
+        if self.instance:
+            qs = qs.exclude(id=self.instance.id)
+        if qs.exists():
+            raise serializers.ValidationError(f"Invoice number {value} already exists")
+        return value
+
+    def validate(self, attrs):
+        # Map 'amount' to 'invoice_amount' if provided
+        if 'amount' in attrs:
+            attrs['invoice_amount'] = attrs.pop('amount')
+        
+        # Auto-calculate due date if not provided
+        if not attrs.get('due_date') and attrs.get('invoice_date'):
+            customer = attrs.get('customer')
+            if customer:
+                payment_terms_days = getattr(customer, 'payment_terms', 30)
+                from datetime import timedelta
+                attrs['due_date'] = attrs['invoice_date'] + timedelta(days=payment_terms_days)
+        
+        return attrs
+
+    def create(self, validated_data):
+        tenant = get_current_tenant()
+        if not tenant:
+            raise serializers.ValidationError("No tenant context")
+
+        request = self.context.get('request')
+        if request and request.user:
+            validated_data['created_by'] = request.user
+        validated_data['tenant'] = tenant
+
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Handle document replacement
+        new_doc = validated_data.get('invoice_document', None)
+        if new_doc and instance.invoice_document:
+            try:
+                instance.invoice_document.delete(save=False)
+            except Exception:
+                pass
+
+        return super().update(instance, validated_data)
+        
+class CustomerPurchaseOrderSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source='customer.display_name', read_only=True)
+    customer_code = serializers.CharField(source='customer.party_code', read_only=True)
+    document_url = serializers.SerializerMethodField()
+    
+    # Add amount field that maps to po_amount
+    amount = serializers.DecimalField(
+        max_digits=12, 
+        decimal_places=2, 
+        write_only=True, 
+        required=False
+    )
+    
+    class Meta:
+        model = CustomerPurchaseOrder
+        fields = [
+            'id', 'po_number', 'customer', 'customer_name', 'customer_code', 
+            'po_date', 'delivery_required_by', 'po_amount', 'amount', 'status', 
+            'description', 'special_instructions', 'po_document', 'document_url',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['tenant', 'created_by', 'po_amount']
+    
+    def get_document_url(self, obj):
+        """Get document URL if exists"""
+        if obj.po_document and hasattr(obj.po_document, 'url'):
+            return obj.po_document.url
+        return None
+    
+    def validate_po_number(self, value):
+        """Validate PO number uniqueness within tenant"""
+        tenant = get_current_tenant()
+        if not tenant:
+            raise serializers.ValidationError("No tenant context")
+        
+        # Check if PO number already exists for this tenant and customer
+        customer = self.initial_data.get('customer')
+        if customer:
+            qs = CustomerPurchaseOrder.objects.filter(
+                tenant=tenant, 
+                customer_id=customer,
+                po_number=value
+            )
+            if self.instance:
+                qs = qs.exclude(id=self.instance.id)
+            if qs.exists():
+                raise serializers.ValidationError(f"PO number {value} already exists for this customer")
+        return value
+    
+    def validate(self, attrs):
+        """Map amount field to po_amount and handle validation"""
+        # Map 'amount' to 'po_amount' if provided
+        if 'amount' in attrs:
+            attrs['po_amount'] = attrs.pop('amount')
+        
+        return attrs
+    
+    def create(self, validated_data):
+        """Create CustomerPurchaseOrder with proper tenant and user context"""
+        tenant = get_current_tenant()
+        if not tenant:
+            raise serializers.ValidationError("No tenant context")
+        
+        request = self.context.get('request')
+        if request and request.user:
+            validated_data['created_by'] = request.user
+        validated_data['tenant'] = tenant
+        
+        # Ensure is_active is True
+        validated_data['is_active'] = True
+        
+        return super().create(validated_data)
+    
+    def update(self, instance, validated_data):
+        """Handle document replacement safely"""
+        new_doc = validated_data.get('po_document', None)
+        if new_doc and instance.po_document:
+            # Delete old document
+            try:
+                instance.po_document.delete(save=False)
+            except Exception:
+                logger.warning(f"Failed to delete old document for CPO {instance.id}")
+        
+        return super().update(instance, validated_data)
+
+class PaymentAdviceSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source='customer.display_name', read_only=True)
+    mentioned_invoices_details = CustomerInvoiceSerializer(source='mentioned_invoices', many=True, read_only=True)
+    
+    class Meta:
+        model = PaymentAdvice
+        fields = '__all__'
+        read_only_fields = ['tenant', 'created_by']

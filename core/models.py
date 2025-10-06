@@ -1,10 +1,47 @@
-# models.py - Core ERP Models
+# models.py - Core ERP Models with File Storage
 
 from django.db import models
 from django.contrib.auth.models import User
-from django.core.validators import MinValueValidator
-import json
-from django.utils import timezone 
+from django.core.validators import MinValueValidator, FileExtensionValidator
+from django.utils import timezone
+import os
+
+# ===== FILE UPLOAD HELPERS =====
+def get_product_image_path(instance, filename):
+    """Generate upload path for product images"""
+    ext = filename.split('.')[-1]
+    
+    # Handle both Product and ProductImage instances
+    if hasattr(instance, 'sku'):
+        # This is a Product instance (primary_image)
+        sku = instance.sku
+        tenant_id = instance.tenant.id
+    else:
+        # This is a ProductImage instance
+        sku = instance.product.sku
+        tenant_id = instance.product.tenant.id
+    
+    return f'tenants/{tenant_id}/products/{sku}/images/{filename}'
+
+def get_employee_document_path(instance, filename):
+    """Generate upload path for employee documents"""
+    return f'tenants/{instance.employee.tenant.id}/employees/{instance.employee.employee_code}/docs/{filename}'
+
+def get_po_document_path(instance, filename):
+    """Generate upload path for purchase order documents"""
+    return f'tenants/{instance.tenant.id}/purchase_orders/{instance.po_number}/{filename}'
+
+def get_invoice_document_path(instance, filename):
+    """Generate upload path for customer invoices"""
+    return f'tenants/{instance.tenant.id}/invoices/{instance.invoice_number}/{filename}'
+
+def get_payment_advice_path(instance, filename):
+    """Generate upload path for payment advices"""
+    return f'tenants/{instance.tenant.id}/payment_advices/{instance.advice_number}/{filename}'
+
+def get_customer_po_path(instance, filename):
+    """Generate upload path for customer POs"""
+    return f'tenants/{instance.tenant.id}/customer_pos/{instance.customer.party_code}/{filename}'
 
 # ===== TENANT MANAGEMENT =====
 class Tenant(models.Model):
@@ -22,7 +59,7 @@ class Tenant(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     gstin = models.CharField(max_length=15, blank=True)
     company_address = models.TextField(blank=True, default="")  
-    modules_enabled = models.JSONField(default=dict)  # {"production": True, "finance": True}
+    modules_enabled = models.JSONField(default=dict)
     
     def __str__(self):
         return self.company_name
@@ -85,10 +122,8 @@ class CostCenter(BaseModel):
     cost_center_code = models.CharField(max_length=20)
     name = models.CharField(max_length=200)
     parent_center = models.ForeignKey('self', null=True, blank=True, on_delete=models.CASCADE)
-
-    # manager will be linked after Employee is created
     manager = models.ForeignKey(
-        'Employee',  # string reference is fine
+        'Employee',
         null=True, blank=True,
         on_delete=models.SET_NULL,
         related_name="manages_cost_centers"
@@ -101,7 +136,7 @@ class CostCenter(BaseModel):
         return f"{self.cost_center_code} - {self.name}"
 
 class Product(BaseModel):
-    """Master product catalog"""
+    """Master product catalog with image support"""
     PRODUCT_TYPES = [
         ('raw_material', 'Raw Material'),
         ('finished_good', 'Finished Good'),
@@ -122,18 +157,56 @@ class Product(BaseModel):
     product_type = models.CharField(max_length=20, choices=PRODUCT_TYPES)
     uom = models.CharField(max_length=10, choices=UOM_CHOICES)
     category = models.CharField(max_length=100)
-    standard_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)  # Fixed decimal default
+    standard_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
     reorder_point = models.IntegerField(default=0)
-    specifications = models.TextField(null=True, blank=True, default='')  # Changed to TextField
+    specifications = models.TextField(null=True, blank=True, default='')
+    
+    # PRIMARY IMAGE
+    primary_image = models.ImageField(
+        upload_to=get_product_image_path,
+        null=True,
+        blank=True,
+        validators=[FileExtensionValidator(['jpg', 'jpeg', 'png', 'webp'])],
+        help_text="Main product image (JPG, PNG, WEBP)"
+    )
     
     class Meta:
         unique_together = ['tenant', 'sku']
     
     def __str__(self):
         return f"{self.sku} - {self.product_name}"
+    
+    def delete(self, *args, **kwargs):
+        """Delete associated files when product is deleted"""
+        if self.primary_image:
+            if os.path.isfile(self.primary_image.path):
+                os.remove(self.primary_image.path)
+        super().delete(*args, **kwargs)
+
+class ProductImage(BaseModel):
+    """Additional product images (optional - for multiple images)"""
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='additional_images')
+    image = models.ImageField(
+        upload_to=get_product_image_path,
+        validators=[FileExtensionValidator(['jpg', 'jpeg', 'png', 'webp'])]
+    )
+    caption = models.CharField(max_length=200, blank=True)
+    display_order = models.IntegerField(default=0)
+    
+    class Meta:
+        ordering = ['display_order', 'created_at']
+    
+    def __str__(self):
+        return f"{self.product.sku} - Image {self.id}"
+    
+    def delete(self, *args, **kwargs):
+        if self.image:
+            if os.path.isfile(self.image.path):
+                os.remove(self.image.path)
+        super().delete(*args, **kwargs)
 
 class Party(BaseModel):
-    """Master party record - customers, suppliers, others (not employees)"""
+    """Master party record - customers, suppliers, others"""
     PARTY_TYPES = [
         ('customer', 'Customer'),
         ('supplier', 'Supplier'),
@@ -146,8 +219,8 @@ class Party(BaseModel):
     display_name = models.CharField(max_length=200)
     gstin = models.CharField(max_length=15, blank=True)
     pan = models.CharField(max_length=10, blank=True)
-    contact_details = models.JSONField(default=dict)  # emails, phones, addresses
-    payment_terms = models.IntegerField(default=30)  # days
+    contact_details = models.JSONField(default=dict)
+    payment_terms = models.IntegerField(default=30)
     credit_limit = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     
     class Meta:
@@ -195,6 +268,38 @@ class Employee(BaseModel):
     def __str__(self):
         return f"{self.employee_code} - {self.full_name}"
 
+class EmployeeDocument(BaseModel):
+    """Employee documents - ID proofs, certificates, etc."""
+    DOCUMENT_TYPES = [
+        ('id_proof', 'ID Proof'),
+        ('address_proof', 'Address Proof'),
+        ('educational', 'Educational Certificate'),
+        ('experience', 'Experience Letter'),
+        ('other', 'Other')
+    ]
+    
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='documents')
+    document_type = models.CharField(max_length=20, choices=DOCUMENT_TYPES)
+    document_name = models.CharField(max_length=200)
+    document_file = models.FileField(
+        upload_to=get_employee_document_path,
+        validators=[FileExtensionValidator(['pdf', 'jpg', 'jpeg', 'png'])],
+        help_text="Upload PDF or Image (JPG, PNG)"
+    )
+    expiry_date = models.DateField(null=True, blank=True, help_text="For documents like ID cards")
+    notes = models.TextField(blank=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.employee.employee_code} - {self.document_name}"
+    
+    def delete(self, *args, **kwargs):
+        if self.document_file:
+            if os.path.isfile(self.document_file.path):
+                os.remove(self.document_file.path)
+        super().delete(*args, **kwargs)
 
 class WorkOrder(BaseModel):
     """Production work orders"""
@@ -214,7 +319,8 @@ class WorkOrder(BaseModel):
     due_date = models.DateField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='planned')
     cost_center = models.ForeignKey(CostCenter, on_delete=models.CASCADE)
-    priority = models.IntegerField(default=5)  # 1=High, 10=Low
+    priority = models.IntegerField(default=5)
+    description = models.TextField(blank=True, null=True)
     
     class Meta:
         unique_together = ['tenant', 'wo_number']
@@ -227,7 +333,7 @@ class WorkOrder(BaseModel):
         if self.quantity_planned > 0:
             return (self.quantity_completed / self.quantity_planned) * 100
         return 0
-
+        
 class ProductionEntry(BaseModel):
     """Hourly production recording"""
     work_order = models.ForeignKey(WorkOrder, on_delete=models.CASCADE)
@@ -238,7 +344,7 @@ class ProductionEntry(BaseModel):
     quantity_rejected = models.IntegerField(default=0)
     downtime_minutes = models.IntegerField(default=0)
     downtime_reason = models.CharField(max_length=200, blank=True)
-    shift = models.CharField(max_length=20)  # A, B, C, General
+    shift = models.CharField(max_length=20)
     
     def __str__(self):
         return f"{self.work_order.wo_number} - {self.entry_datetime}"
@@ -258,7 +364,7 @@ class Warehouse(BaseModel):
         return f"{self.warehouse_code} - {self.warehouse_name}"
 
 class StockMovement(BaseModel):
-    """All inventory movements (receipts, issues, transfers)"""
+    """All inventory movements"""
     MOVEMENT_TYPES = [
         ('receipt', 'Receipt'),
         ('issue', 'Issue'),
@@ -275,7 +381,7 @@ class StockMovement(BaseModel):
     warehouse = models.ForeignKey(Warehouse, on_delete=models.CASCADE)
     quantity = models.DecimalField(max_digits=12, decimal_places=3)
     unit_cost = models.DecimalField(max_digits=12, decimal_places=4, default=0)
-    reference_doc = models.CharField(max_length=50, blank=True)  # WO number, PO number, etc.
+    reference_doc = models.CharField(max_length=50, blank=True)
     movement_date = models.DateTimeField()
     
     class Meta:
@@ -320,52 +426,9 @@ class GLJournalLine(BaseModel):
     class Meta:
         unique_together = ['tenant', 'journal', 'line_number']
 
-# ===== AI PREPARATION =====
-class AIQueryLog(BaseModel):
-    """Log all AI queries for learning and audit"""
-    user_query = models.TextField()
-    generated_sql = models.TextField(blank=True)
-    execution_time_ms = models.IntegerField(default=0)
-    result_rows = models.IntegerField(default=0)
-    was_successful = models.BooleanField(default=False)
-    error_message = models.TextField(blank=True)
-    
-    def __str__(self):
-        return f"Query at {self.created_at}"
-
-# ===== SYSTEM AUTOMATION =====
-class AutomationRule(BaseModel):
-    """System automation rules"""
-    TRIGGER_TYPES = [
-        ('time_based', 'Time Based'),
-        ('event_based', 'Event Based'),
-        ('threshold_based', 'Threshold Based')
-    ]
-    
-    rule_name = models.CharField(max_length=200)
-    trigger_type = models.CharField(max_length=20, choices=TRIGGER_TYPES)
-    trigger_condition = models.JSONField(default=dict)
-    action_definition = models.JSONField(default=dict)
-    is_enabled = models.BooleanField(default=True)
-    last_executed = models.DateTimeField(null=True, blank=True)
-    
-    def __str__(self):
-        return self.rule_name
-
-class TenantEmailConfig(BaseModel):
-    """Stores email preferences for weekly reports per tenant"""
-    tenant = models.ForeignKey('Tenant', on_delete=models.CASCADE, related_name='email_configs')
-    weekly_report_enabled = models.BooleanField(default=True)
-    recipients = models.JSONField(default=list)  # e.g., ["owner@company.com"]
-    send_day = models.CharField(max_length=10, default='sunday', choices=[('monday', 'Monday'), ('sunday', 'Sunday')])
-    send_time = models.TimeField(default='08:00:00')
-    
-    class Meta:
-        unique_together = ['tenant']
-
-
+# ===== PURCHASE ORDERS =====
 class PurchaseOrder(BaseModel):
-    """Purchase Order management - optional for tracking supplier orders with simple amount"""
+    """Purchase Order management with document attachment"""
     STATUS_CHOICES = [
         ('draft', 'Draft'),
         ('sent', 'Sent'),
@@ -382,10 +445,19 @@ class PurchaseOrder(BaseModel):
     )
     order_date = models.DateField(default=timezone.now)
     expected_delivery = models.DateField(null=True, blank=True)
-    delivery_address = models.TextField(blank=True)  # Optional: use tenant's address by default
+    delivery_address = models.TextField(blank=True)
     terms_conditions = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
-    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)  # Simple amount field
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    
+    # DOCUMENT ATTACHMENT
+    po_document = models.FileField(
+        upload_to=get_po_document_path,
+        null=True,
+        blank=True,
+        validators=[FileExtensionValidator(['pdf', 'docx', 'xlsx'])],
+        help_text="Upload PO document (PDF, DOCX, XLSX)"
+    )
     
     class Meta:
         unique_together = ['tenant', 'po_number']
@@ -395,10 +467,15 @@ class PurchaseOrder(BaseModel):
         return f"{self.po_number} - {self.supplier.display_name}"
     
     def save(self, *args, **kwargs):
-        # Auto-calculate amount from lines
-        if self.pk:  # Only on update
+        if self.pk:
             self.amount = sum(line.subtotal for line in self.lines.all())
         super().save(*args, **kwargs)
+    
+    def delete(self, *args, **kwargs):
+        if self.po_document:
+            if os.path.isfile(self.po_document.path):
+                os.remove(self.po_document.path)
+        super().delete(*args, **kwargs)
 
 class PurchaseOrderLine(BaseModel):
     """Line items for Purchase Orders"""
@@ -420,3 +497,246 @@ class PurchaseOrderLine(BaseModel):
     def save(self, *args, **kwargs):
         self.subtotal = self.quantity * self.unit_price
         super().save(*args, **kwargs)
+
+# ===== CUSTOMER INVOICES =====
+class CustomerInvoice(BaseModel):
+    """Customer invoices with document attachment"""
+    STATUS_CHOICES = [
+        ('sent', 'Sent'),
+        ('paid', 'Paid'),
+        ('partial_paid', 'Partially Paid'),
+        ('overdue', 'Overdue'),
+        ('cancelled', 'Cancelled')
+    ]
+    
+    invoice_number = models.CharField(max_length=50)
+    customer = models.ForeignKey(
+        Party, 
+        on_delete=models.CASCADE,
+        limit_choices_to={'party_type': 'customer'},
+        related_name='invoices'
+    )
+    invoice_date = models.DateField()
+    due_date = models.DateField(null=True, blank=True)
+    invoice_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='sent')
+    reference_customer_po = models.ForeignKey(
+        'CustomerPurchaseOrder', 
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='invoices'
+    )
+    notes = models.TextField(blank=True)
+    
+    # DOCUMENT ATTACHMENT
+    invoice_document = models.FileField(
+        upload_to=get_invoice_document_path,
+        null=True,
+        blank=True,
+        validators=[FileExtensionValidator(['pdf'])],
+        help_text="Upload invoice PDF"
+    )
+    
+    class Meta:
+        unique_together = ['tenant', 'invoice_number']
+        ordering = ['-invoice_date']
+    
+    def __str__(self):
+        return f"{self.invoice_number} - {self.customer.display_name}"
+    
+    def delete(self, *args, **kwargs):
+        """
+        Delete the attached file using the storage API, then delete the DB row.
+        This avoids direct filesystem assumptions (works with S3, remote storages).
+        """
+        if self.invoice_document:
+            try:
+                self.invoice_document.delete(save=False)
+            except Exception:
+                # keep deletion best-effort; don't fail the DB delete if file deletion fails
+                pass
+        super().delete(*args, **kwargs)
+
+class CustomerPurchaseOrder(BaseModel):
+    """Customer POs received with document attachment"""
+    STATUS_CHOICES = [
+        ('received', 'Received'),
+        ('acknowledged', 'Acknowledged'),
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+        ('cancelled', 'Cancelled')
+    ]
+    
+    po_number = models.CharField(max_length=50)
+    customer = models.ForeignKey(
+        Party,
+        on_delete=models.CASCADE,
+        limit_choices_to={'party_type': 'customer'},
+        related_name='customer_purchase_orders'
+    )
+    po_date = models.DateField()
+    delivery_required_by = models.DateField(null=True, blank=True)
+    po_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='received')
+    description = models.TextField(blank=True)
+    special_instructions = models.TextField(blank=True)
+    
+    # DOCUMENT ATTACHMENT
+    po_document = models.FileField(
+        upload_to=get_customer_po_path,
+        null=True,
+        blank=True,
+        validators=[FileExtensionValidator(['pdf', 'docx', 'xlsx'])],
+        help_text="Upload customer PO document"
+    )
+    
+    class Meta:
+        unique_together = ['tenant', 'customer', 'po_number']
+        ordering = ['-po_date']
+    
+    def __str__(self):
+        return f"Customer PO: {self.po_number} - {self.customer.display_name}"
+    
+    def save(self, *args, **kwargs):
+        """Ensure is_active is True when creating new records"""
+        if not self.pk:  # Only for new instances
+            self.is_active = True
+        super().save(*args, **kwargs)
+    
+    def delete(self, *args, **kwargs):
+        """Safe file deletion using storage API"""
+        if self.po_document:
+            try:
+                self.po_document.delete(save=False)
+            except Exception:
+                # Keep deletion best-effort
+                pass
+        super().delete(*args, **kwargs)
+        
+class PaymentAdvice(BaseModel):
+    """Payment advices from customers with document attachment"""
+    advice_number = models.CharField(max_length=50, blank=True)
+    customer = models.ForeignKey(
+        Party,
+        on_delete=models.CASCADE,
+        limit_choices_to={'party_type': 'customer'},
+        related_name='payment_advices'
+    )
+    advice_date = models.DateField()
+    total_payment_amount = models.DecimalField(max_digits=15, decimal_places=2)
+    mentioned_invoices = models.ManyToManyField(
+        CustomerInvoice,
+        through='PaymentAdviceInvoice',
+        related_name='payment_advices'
+    )
+    notes = models.TextField(blank=True)
+    
+    # DOCUMENT ATTACHMENT
+    advice_document = models.FileField(
+        upload_to=get_payment_advice_path,
+        null=True,
+        blank=True,
+        validators=[FileExtensionValidator(['pdf', 'jpg', 'jpeg', 'png'])],
+        help_text="Upload payment advice document"
+    )
+    
+    class Meta:
+        ordering = ['-advice_date']
+    
+    def __str__(self):
+        return f"Payment Advice {self.advice_number} - {self.customer.display_name}"
+    
+    def delete(self, *args, **kwargs):
+        if self.advice_document:
+            if os.path.isfile(self.advice_document.path):
+                os.remove(self.advice_document.path)
+        super().delete(*args, **kwargs)
+
+class PaymentAdviceInvoice(BaseModel):
+    """Track invoices mentioned in payment advice"""
+    payment_advice = models.ForeignKey(PaymentAdvice, on_delete=models.CASCADE)
+    invoice = models.ForeignKey(CustomerInvoice, on_delete=models.CASCADE)
+    amount_mentioned = models.DecimalField(max_digits=12, decimal_places=2)
+    
+    class Meta:
+        unique_together = ['payment_advice', 'invoice']
+    
+    def __str__(self):
+        return f"{self.payment_advice.advice_number} - {self.invoice.invoice_number}"
+
+# ===== AI & SYSTEM =====
+class AIQueryLog(BaseModel):
+    """Log all AI queries for learning and audit"""
+    user_query = models.TextField()
+    generated_sql = models.TextField(blank=True)
+    execution_time_ms = models.IntegerField(default=0)
+    result_rows = models.IntegerField(default=0)
+    was_successful = models.BooleanField(default=False)
+    error_message = models.TextField(blank=True)
+    
+    def __str__(self):
+        return f"Query at {self.created_at}"
+
+class AutomationRule(BaseModel):
+    """System automation rules"""
+    TRIGGER_TYPES = [
+        ('time_based', 'Time Based'),
+        ('event_based', 'Event Based'),
+        ('threshold_based', 'Threshold Based')
+    ]
+    
+    rule_name = models.CharField(max_length=200)
+    trigger_type = models.CharField(max_length=20, choices=TRIGGER_TYPES)
+    trigger_condition = models.JSONField(default=dict)
+    action_definition = models.JSONField(default=dict)
+    is_enabled = models.BooleanField(default=True)
+    last_executed = models.DateTimeField(null=True, blank=True)
+    
+    def __str__(self):
+        return self.rule_name
+
+class TenantEmailConfig(BaseModel):
+    """Email preferences for weekly reports"""
+    tenant = models.ForeignKey('Tenant', on_delete=models.CASCADE, related_name='email_configs')
+    weekly_report_enabled = models.BooleanField(default=True)
+    recipients = models.JSONField(default=list)
+    send_day = models.CharField(max_length=10, default='sunday', choices=[('monday', 'Monday'), ('sunday', 'Sunday')])
+    send_time = models.TimeField(default='08:00:00')
+    
+    class Meta:
+        unique_together = ['tenant']
+
+# ===== ARCHIVES =====
+class GLJournalArchive(BaseModel):
+    """Archived GL Journals"""
+    journal_number = models.CharField(max_length=30)
+    posting_date = models.DateField()
+    reference = models.CharField(max_length=255, blank=True)
+    narration = models.TextField(blank=True)
+    total_debit = models.DecimalField(max_digits=15, decimal_places=2)
+    total_credit = models.DecimalField(max_digits=15, decimal_places=2)
+    status = models.CharField(max_length=20)
+    original_id = models.IntegerField()
+    archived_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['tenant', 'journal_number']),
+            models.Index(fields=['posting_date'])
+        ]
+
+class GLJournalLineArchive(BaseModel):
+    """Archived GL Journal Lines"""
+    journal = models.ForeignKey(GLJournalArchive, on_delete=models.CASCADE, related_name='lines')
+    line_number = models.IntegerField()
+    account_code = models.CharField(max_length=20)
+    cost_center_code = models.CharField(max_length=20, blank=True)
+    debit_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    credit_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    description = models.TextField(blank=True)
+    original_id = models.IntegerField()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['journal', 'line_number'])
+        ]

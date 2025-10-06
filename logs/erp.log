@@ -16082,3 +16082,5 @@ INFO 2025-09-21 23:19:30,516 basehttp 2348 8280 code 400, message Bad request ve
 INFO 2025-09-21 23:19:30,516 basehttp 2348 7408 code 400, message Bad request version ('nä\x05øyCSs|Ì')
 ERROR 2025-09-21 23:19:30,516 basehttp 2348 8280 You're accessing the development server over HTTPS, but it only supports HTTP.
 ERROR 2025-09-21 23:19:30,516 basehttp 2348 7408 You're accessing the development server over HTTPS, but it only supports HTTP.
+INFO 2025-10-06 10:36:22,494 autoreload 7008 6600 Watching for file changes with StatReloader
+INFO 2025-10-06 10:36:51,874 autoreload 7124 6476 Watching for file changes with StatReloader

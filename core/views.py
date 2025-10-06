@@ -4,7 +4,7 @@ from rest_framework.decorators import api_view, action, permission_classes
 from rest_framework import status, permissions, generics, viewsets, filters
 from django.contrib.auth import login, logout  
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from .serializers import TenantWithAdminSerializer, WarehouseSerializer, PurchaseOrderSerializer, ChartOfAccountsSerializer, LoginSerializer, ProductSerializer, WorkOrderSerializer, ProductionEntrySerializer, EquipmentSerializer, EmployeeSerializer, StockMovementSerializer, GLJournalSerializer, CostCenterSerializer, PartySerializer
+from .serializers import TenantWithAdminSerializer, WarehouseSerializer, EmployeeDocumentSerializer, PaymentAdviceSerializer, CustomerPurchaseOrderSerializer, CustomerInvoiceSerializer, PurchaseOrderSerializer, ChartOfAccountsSerializer, LoginSerializer, ProductSerializer, WorkOrderSerializer, ProductionEntrySerializer, EquipmentSerializer, EmployeeSerializer, StockMovementSerializer, GLJournalSerializer, CostCenterSerializer, PartySerializer
 from django.core.cache import cache
 from django.db.models import Sum, Avg, Count, Q, F, Case, When, DecimalField, Max
 from typing import Dict, List, Any, Optional
@@ -14,7 +14,8 @@ from django.shortcuts import get_object_or_404
 from datetime import datetime, timedelta
 from decimal import Decimal
 from django.middleware.csrf import get_token
-
+import os  
+from rest_framework import parsers
 from django.http import HttpResponse
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
@@ -24,6 +25,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, 
 from reportlab.lib import colors
 import io
 
+from .reconciliation_service import ReconciliationService
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
@@ -42,7 +44,9 @@ from .enhanced_ai_engine import ERPAIEngine
 
 
 from .models import (
-    Tenant, TenantUser, Product, WorkOrder, ProductionEntry, 
+    Tenant, TenantUser, Product, WorkOrder, ProductionEntry, CustomerInvoice, 
+    PaymentAdvice, 
+    PaymentAdviceInvoice, CustomerPurchaseOrder,
     Equipment, Employee, StockMovement, ChartOfAccounts, 
     GLJournal, GLJournalLine, CostCenter, Warehouse, Party, PurchaseOrder
 )
@@ -265,7 +269,37 @@ class ProductViewSet(viewsets.ModelViewSet):
             'total_items': len(data),
             'data': data
         })
+    @action(detail=True, methods=['post'], parser_classes=[parsers.MultiPartParser])
+    def upload_image(self, request, pk=None):
+            """Upload primary product image"""
+            product = self.get_object()
+            
+            if 'image' not in request.FILES:
+                return Response({'error': 'No image file provided'}, status=400)
+            
+            # Delete old image if exists
+            if product.primary_image:
+                product.primary_image.delete(save=False)
+            
+            product.primary_image = request.FILES['image']
+            product.save()
+            
+            return Response({
+                'message': 'Image uploaded successfully',
+                'image_url': product.primary_image.url if product.primary_image else None
+            })
 
+    @action(detail=True, methods=['delete'])
+    def delete_image(self, request, pk=None):
+            """Delete primary product image"""
+            product = self.get_object()
+            
+            if product.primary_image:
+                product.primary_image.delete(save=True)
+                return Response({'message': 'Image deleted successfully'})
+            
+            return Response({'error': 'No image to delete'}, status=400)
+            
     @action(detail=False, methods=['get'], url_path='stock-report-pdf')
     def stock_report_pdf(self, request):
         tenant = get_current_tenant()
@@ -1917,7 +1951,26 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         po.save()
         
         return Response({'message': 'PO cancelled', 'status': po.status})
+
+    @action(detail=True, methods=['post'], parser_classes=[parsers.MultiPartParser])
+    def upload_document(self, request, pk=None):
+        """Upload PO document"""
+        po = self.get_object()
         
+        if 'document' not in request.FILES:
+            return Response({'error': 'No document file provided'}, status=400)
+        
+        if po.po_document:
+            po.po_document.delete(save=False)
+        
+        po.po_document = request.FILES['document']
+        po.save()
+        
+        return Response({
+            'message': 'Document uploaded successfully',
+            'document_url': po.po_document.url if po.po_document else None
+        })    
+
     @action(detail=True, methods=['get'])
     def download_pdf(self, request, pk=None):
         """Generate and download PO as PDF with enhanced UI"""
@@ -2059,3 +2112,1028 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         response = HttpResponse(buffer, content_type='application/pdf')
         response['Content-Disposition'] = f'attachment; filename="PO_{po.po_number}.pdf"'
         return response
+
+class EmployeeDocumentViewSet(viewsets.ModelViewSet):
+    serializer_class = EmployeeDocumentSerializer
+    permission_classes = [IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+    
+    def get_queryset(self):
+        tenant = get_current_tenant()
+        queryset = EmployeeDocument.objects.filter(tenant=tenant) if tenant else EmployeeDocument.objects.none()
+        
+        employee_id = self.request.query_params.get('employee_id')
+        if employee_id:
+            queryset = queryset.filter(employee_id=employee_id)
+        
+        return queryset.order_by('-created_at')
+    
+    def perform_create(self, serializer):
+        tenant = get_current_tenant()
+        serializer.save(tenant=tenant, created_by=self.request.user)
+
+
+class CustomerInvoiceViewSet(viewsets.ModelViewSet):
+    """
+    Single endpoint for create/read/update/delete invoices,
+    supports multipart uploads (invoice_document) on create & update.
+    """
+    serializer_class = CustomerInvoiceSerializer
+    permission_classes = [IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
+
+    def get_queryset(self):
+        tenant = get_current_tenant()
+        return CustomerInvoice.objects.filter(tenant=tenant, is_active=True) if tenant else CustomerInvoice.objects.none()
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        # ensure request is present for serializer to pick up 'amount' and created_by
+        ctx['request'] = self.request
+        return ctx
+
+    def perform_create(self, serializer):
+        tenant = get_current_tenant()
+        # serializer.create will also ensure tenant + created_by, but save here as safety
+        serializer.save(tenant=tenant, created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        # serializer.update handles file replacement cleanup
+        serializer.save()
+
+    @action(detail=True, methods=['post'], parser_classes=[parsers.MultiPartParser], url_path='upload-document')
+    def upload_document(self, request, pk=None):
+        """
+        Convenience endpoint: upload/replace the invoice_document only.
+        Clients can also PATCH the invoice with 'invoice_document' via multipart form.
+        """
+        invoice = self.get_object()
+        if 'invoice_document' not in request.FILES:
+            return Response({'error': 'No document provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        document = request.FILES['invoice_document']
+        if not document.name.lower().endswith('.pdf'):
+            return Response({'error': 'Only PDF files are allowed'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # delete existing file if present
+        if invoice.invoice_document:
+            try:
+                invoice.invoice_document.delete(save=False)
+            except Exception:
+                logger.exception("Failed to delete previous invoice_document")
+
+        invoice.invoice_document = document
+        invoice.save()
+        return Response({'message': 'Invoice document uploaded successfully', 'document_url': invoice.invoice_document.url})
+class CustomerPurchaseOrderViewSet(viewsets.ModelViewSet):
+    """Customer Purchase Order management - POs received from customers"""
+    serializer_class = CustomerPurchaseOrderSerializer
+    permission_classes = [IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['po_number', 'customer__display_name', 'customer__party_code']
+    ordering_fields = ['po_date', 'status', 'created_at']
+    ordering = ['-po_date']
+    
+    def get_queryset(self):
+        tenant = get_current_tenant()
+        
+        if not tenant:
+            return CustomerPurchaseOrder.objects.none()
+        
+        # Only return active records
+        queryset = CustomerPurchaseOrder.objects.filter(tenant=tenant, is_active=True)
+        
+        # Filter by status
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        # Filter by customer
+        customer_id = self.request.query_params.get('customer_id')
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
+        
+        # Filter by date range
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        if start_date:
+            queryset = queryset.filter(po_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(po_date__lte=end_date)
+        
+        return queryset.select_related('customer')
+    
+    def perform_create(self, serializer):
+        """Ensure proper creation with tenant and user context"""
+        tenant = get_current_tenant()
+        if not tenant:
+            raise serializers.ValidationError("No tenant context")
+        
+        # Let the serializer handle the creation with proper context
+        serializer.save()
+    
+    @action(detail=True, methods=['post'], parser_classes=[parsers.MultiPartParser])
+    def upload_document(self, request, pk=None):
+        """Upload customer PO document"""
+        customer_po = self.get_object()
+        
+        if 'document' not in request.FILES:
+            return Response({'error': 'No document file provided'}, status=400)
+        
+        document = request.FILES['document']
+        
+        # Validate file type
+        allowed_extensions = ['.pdf', '.docx', '.xlsx', '.doc', '.xls', '.jpg', '.jpeg', '.png']
+        file_extension = os.path.splitext(document.name)[1].lower()
+        if file_extension not in allowed_extensions:
+            return Response({
+                'error': f'Invalid file type. Allowed types: {", ".join(allowed_extensions)}'
+            }, status=400)
+        
+        # Delete old document if exists
+        if customer_po.po_document:
+            try:
+                customer_po.po_document.delete(save=False)
+            except Exception as e:
+                logger.warning(f"Failed to delete old document: {e}")
+        
+        customer_po.po_document = document
+        customer_po.save()
+        
+        return Response({
+            'message': 'Customer PO document uploaded successfully',
+            'document_url': customer_po.po_document.url if customer_po.po_document else None
+        })
+    
+    @action(detail=True, methods=['delete'])
+    def delete_document(self, request, pk=None):
+        """Delete customer PO document"""
+        customer_po = self.get_object()
+        
+        if not customer_po.po_document:
+            return Response({'error': 'No document to delete'}, status=400)
+        
+        try:
+            customer_po.po_document.delete(save=False)
+            customer_po.po_document = None
+            customer_po.save()
+            return Response({'message': 'Document deleted successfully'})
+        except Exception as e:
+            logger.error(f"Failed to delete document: {e}")
+            return Response({'error': 'Failed to delete document'}, status=500)
+    
+    @action(detail=True, methods=['post'])
+    def acknowledge(self, request, pk=None):
+        """Acknowledge receipt of customer PO"""
+        customer_po = self.get_object()
+        
+        if customer_po.status != 'received':
+            return Response({'error': 'Only received POs can be acknowledged'}, status=400)
+        
+        customer_po.status = 'acknowledged'
+        customer_po.save()
+        
+        logger.info(f"Customer PO {customer_po.po_number} acknowledged by {request.user.username}")
+        
+        return Response({'message': 'Customer PO acknowledged', 'status': customer_po.status})
+    
+    @action(detail=True, methods=['post'])
+    def start_processing(self, request, pk=None):
+        """Mark customer PO as in progress"""
+        customer_po = self.get_object()
+        
+        if customer_po.status not in ['received', 'acknowledged']:
+            return Response({'error': 'Invalid status transition'}, status=400)
+        
+        customer_po.status = 'in_progress'
+        customer_po.save()
+        
+        return Response({'message': 'Customer PO processing started', 'status': customer_po.status})
+    
+    @action(detail=True, methods=['post'])
+    def complete(self, request, pk=None):
+        """Mark customer PO as completed"""
+        customer_po = self.get_object()
+        
+        if customer_po.status != 'in_progress':
+            return Response({'error': 'Only in-progress POs can be completed'}, status=400)
+        
+        customer_po.status = 'completed'
+        customer_po.save()
+        
+        return Response({'message': 'Customer PO completed', 'status': customer_po.status})
+    
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """Cancel customer PO"""
+        customer_po = self.get_object()
+        
+        if customer_po.status in ['completed', 'cancelled']:
+            return Response({'error': 'Cannot cancel completed or already cancelled PO'}, status=400)
+        
+        customer_po.status = 'cancelled'
+        customer_po.save()
+        
+        return Response({'message': 'Customer PO cancelled', 'status': customer_po.status})
+    
+    @action(detail=False, methods=['get'])
+    def status_summary(self, request):
+        """Get count of POs by status"""
+        tenant = get_current_tenant()
+        if not tenant:
+            return Response({'error': 'No tenant context'}, status=400)
+        
+        status_counts = CustomerPurchaseOrder.objects.filter(
+            tenant=tenant, 
+            is_active=True
+        ).values('status').annotate(count=Count('id'))
+        
+        summary = {item['status']: item['count'] for item in status_counts}
+        
+        # Include all possible statuses with 0 count if not present
+        all_statuses = ['received', 'acknowledged', 'in_progress', 'completed', 'cancelled']
+        for status in all_statuses:
+            if status not in summary:
+                summary[status] = 0
+        
+        return Response(summary)
+
+class PaymentAdviceViewSet(viewsets.ModelViewSet):
+    """Payment Advice management - track customer payments"""
+    serializer_class = PaymentAdviceSerializer
+    permission_classes = [IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['advice_number', 'customer__display_name']
+    ordering_fields = ['advice_date', 'total_payment_amount']
+    ordering = ['-advice_date']
+    
+    def get_queryset(self):
+        tenant = get_current_tenant()
+        queryset = PaymentAdvice.objects.filter(tenant=tenant, is_active=True) if tenant else PaymentAdvice.objects.none()
+        
+        # Filter by customer
+        customer_id = self.request.query_params.get('customer_id')
+        if customer_id:
+            queryset = queryset.filter(customer_id=customer_id)
+        
+        # Filter by date range
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        
+        if start_date:
+            queryset = queryset.filter(advice_date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(advice_date__lte=end_date)
+        
+        return queryset.select_related('customer').prefetch_related('mentioned_invoices')
+    
+    def perform_create(self, serializer):
+        tenant = get_current_tenant()
+        
+        # Auto-generate advice number if not provided
+        if not serializer.validated_data.get('advice_number'):
+            last_advice = PaymentAdvice.objects.filter(tenant=tenant).order_by('-id').first()
+            advice_number = f"PA-{timezone.now().strftime('%Y%m')}-{(last_advice.id + 1) if last_advice else 1:04d}"
+            serializer.validated_data['advice_number'] = advice_number
+        
+        serializer.save(tenant=tenant, created_by=self.request.user)
+    
+    @action(detail=True, methods=['post'], parser_classes=[parsers.MultiPartParser])
+    def upload_document(self, request, pk=None):
+        """Upload payment advice document"""
+        payment_advice = self.get_object()
+        
+        if 'document' not in request.FILES:
+            return Response({'error': 'No document file provided'}, status=400)
+        
+        # Delete old document if exists
+        if payment_advice.advice_document:
+            payment_advice.advice_document.delete(save=False)
+        
+        payment_advice.advice_document = request.FILES['document']
+        payment_advice.save()
+        
+        return Response({
+            'message': 'Payment advice document uploaded successfully',
+            'document_url': payment_advice.advice_document.url if payment_advice.advice_document else None
+        })
+    
+    @action(detail=True, methods=['delete'])
+    def delete_document(self, request, pk=None):
+        """Delete payment advice document"""
+        payment_advice = self.get_object()
+        
+        if payment_advice.advice_document:
+            payment_advice.advice_document.delete(save=True)
+            return Response({'message': 'Document deleted successfully'})
+        
+        return Response({'error': 'No document to delete'}, status=400)
+    
+    @action(detail=True, methods=['post'])
+    def link_invoices(self, request, pk=None):
+        """Link invoices mentioned in payment advice"""
+        payment_advice = self.get_object()
+        invoice_links = request.data.get('invoices', [])  # [{'invoice_id': 1, 'amount': 1000}, ...]
+        
+        if not invoice_links:
+            return Response({'error': 'No invoices provided'}, status=400)
+        
+        try:
+            with transaction.atomic():
+                # Clear existing links
+                PaymentAdviceInvoice.objects.filter(payment_advice=payment_advice).delete()
+                
+                # Create new links
+                for link in invoice_links:
+                    invoice = get_object_or_404(
+                        CustomerInvoice, 
+                        id=link['invoice_id'], 
+                        tenant=payment_advice.tenant
+                    )
+                    
+                    PaymentAdviceInvoice.objects.create(
+                        tenant=payment_advice.tenant,
+                        payment_advice=payment_advice,
+                        invoice=invoice,
+                        amount_mentioned=Decimal(str(link['amount'])),
+                        created_by=request.user
+                    )
+                
+                return Response({
+                    'message': f'{len(invoice_links)} invoices linked successfully',
+                    'linked_count': len(invoice_links)
+                })
+                
+        except Exception as e:
+            logger.error(f"Invoice linking failed: {str(e)}")
+            return Response({'error': 'Failed to link invoices'}, status=500)
+    
+    @action(detail=True, methods=['get'])
+    def invoice_allocation(self, request, pk=None):
+        """Get payment allocation details"""
+        payment_advice = self.get_object()
+        
+        allocations = PaymentAdviceInvoice.objects.filter(
+            payment_advice=payment_advice
+        ).select_related('invoice')
+        
+        allocation_data = []
+        for alloc in allocations:
+            allocation_data.append({
+                'invoice_number': alloc.invoice.invoice_number,
+                'invoice_date': alloc.invoice.invoice_date,
+                'invoice_amount': float(alloc.invoice.invoice_amount),
+                'amount_mentioned': float(alloc.amount_mentioned),
+                'invoice_status': alloc.invoice.status
+            })
+        
+        return Response({
+            'payment_advice_number': payment_advice.advice_number,
+            'total_payment': float(payment_advice.total_payment_amount),
+            'total_allocated': sum(float(a.amount_mentioned) for a in allocations),
+            'allocations': allocation_data
+        })
+# Add these fixed views to your views.py
+
+from datetime import datetime, timedelta
+from decimal import Decimal
+import json
+
+class PaymentAdviceReconcileView(APIView):
+    """Reconcile payment advice with customer invoices - Manual Only"""
+    permission_classes = [IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
+    
+    def post(self, request, *args, **kwargs):
+        """Process payment advice and reconcile with invoices - Manual Only"""
+        tenant = get_current_tenant()
+        if not tenant:
+            return Response({'error': 'No tenant context'}, status=400)
+        
+        customer_id = request.data.get('customer_id')
+        
+        if not customer_id:
+            return Response({'error': 'Customer ID is required'}, status=400)
+        
+        try:
+            customer = Party.objects.get(id=customer_id, tenant=tenant, party_type='customer')
+        except Party.DoesNotExist:
+            return Response({'error': 'Customer not found'}, status=404)
+        
+        reconciliation_service = ReconciliationService(tenant)
+        return self._process_manual_reconciliation(request, customer, reconciliation_service)
+    
+    def _process_manual_reconciliation(self, request, customer, reconciliation_service):
+        """Process manual reconciliation"""
+        manual_invoice_numbers = request.data.get('invoice_numbers', [])
+        
+        if not manual_invoice_numbers:
+            return Response({'error': 'No invoice numbers provided'}, status=400)
+        
+        try:
+            reconciliation_result = reconciliation_service.reconcile_manual_data(
+                customer=customer,
+                manual_invoice_numbers=manual_invoice_numbers
+            )
+            
+            return Response({
+                'success': True,
+                'reconciliation': reconciliation_result,
+                'message': 'Manual reconciliation completed successfully'
+            })
+            
+        except Exception as e:
+            logger.error(f"Manual reconciliation failed: {e}", exc_info=True)
+            return Response({
+                'success': False,
+                'error': f'Reconciliation failed: {str(e)}'
+            }, status=500)
+
+class CustomerInvoiceManualCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    def post(self, request, *args, **kwargs):
+        tenant = get_current_tenant()
+        if not tenant:
+            return Response({'error': 'No tenant context'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Use the serializer to validate & create (handles file upload, amount mapping, due_date calc)
+        serializer = CustomerInvoiceSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            invoice = serializer.save()
+            return Response({'success': True, 'invoice': CustomerInvoiceSerializer(invoice).data})
+        else:
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ReconciliationConfirmView(APIView):
+    """Confirm and save reconciliation results"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, *args, **kwargs):
+        """Save confirmed reconciliation and create payment advice"""
+        tenant = get_current_tenant()
+        if not tenant:
+            return Response({'error': 'No tenant context'}, status=400)
+        
+        customer_id = request.data.get('customer_id')
+        advice_number = request.data.get('advice_number')
+        advice_date_str = request.data.get('advice_date')
+        total_amount_str = request.data.get('total_amount')
+        matched_invoices = request.data.get('matched_invoices', [])
+        notes = request.data.get('notes', '')
+        
+        if not all([customer_id, advice_number, advice_date_str, total_amount_str]):
+            return Response({'error': 'Missing required fields'}, status=400)
+        
+        try:
+            customer = Party.objects.get(id=customer_id, tenant=tenant, party_type='customer')
+            
+            # Parse date
+            try:
+                advice_date = datetime.strptime(advice_date_str, '%Y-%m-%d').date()
+            except (ValueError, TypeError) as e:
+                return Response({
+                    'error': f'Invalid date format: {advice_date_str}. Expected YYYY-MM-DD'
+                }, status=400)
+            
+            # Parse amount
+            try:
+                total_amount = Decimal(str(total_amount_str).replace(',', ''))
+            except (ValueError, TypeError) as e:
+                return Response({
+                    'error': f'Invalid amount: {total_amount_str}'
+                }, status=400)
+            
+            reconciliation_service = ReconciliationService(tenant)
+            
+            # Prepare invoice data
+            matched_invoice_ids = [inv['invoice_id'] for inv in matched_invoices]
+            invoice_amounts = {}
+            
+            for inv in matched_invoices:
+                invoice_id = inv['invoice_id']
+                amount_str = inv.get('amount_in_advice') or inv.get('invoice_amount')
+                
+                try:
+                    invoice_amounts[invoice_id] = Decimal(str(amount_str).replace(',', ''))
+                except (ValueError, TypeError):
+                    # Use invoice's actual amount as fallback
+                    try:
+                        invoice = CustomerInvoice.objects.get(id=invoice_id, tenant=tenant)
+                        invoice_amounts[invoice_id] = invoice.invoice_amount
+                    except:
+                        continue
+            
+            # Create payment advice with reconciliation
+            payment_advice, reconciliation_summary = reconciliation_service.create_payment_advice_with_reconciliation(
+                customer=customer,
+                advice_number=advice_number,
+                advice_date=advice_date,
+                total_payment_amount=total_amount,
+                matched_invoice_ids=matched_invoice_ids,
+                invoice_amounts=invoice_amounts,
+                created_by=request.user,
+                notes=notes
+            )
+            
+            # Handle document upload if provided
+            if 'document' in request.FILES:
+                payment_advice.advice_document = request.FILES['document']
+                payment_advice.save()
+            
+            return Response({
+                'success': True,
+                'payment_advice_id': payment_advice.id,
+                'advice_number': payment_advice.advice_number,
+                'reconciliation_summary': reconciliation_summary,
+                'message': 'Reconciliation confirmed and payment advice created'
+            })
+            
+        except Party.DoesNotExist:
+            return Response({'error': 'Customer not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Reconciliation confirmation failed: {e}", exc_info=True)
+            return Response({
+                'success': False,
+                'error': f'Confirmation failed: {str(e)}'
+            }, status=500)
+
+
+@api_view(['GET'])
+def customer_unpaid_invoices(request, customer_id):
+    """Get unpaid invoices for a customer for manual reconciliation"""
+    tenant = get_current_tenant()
+    if not tenant:
+        return Response({'error': 'No tenant context'}, status=400)
+    
+    try:
+        customer = Party.objects.get(id=customer_id, tenant=tenant, party_type='customer')
+        
+        reconciliation_service = ReconciliationService(tenant)
+        unpaid_invoices = reconciliation_service.get_unpaid_invoices(customer)
+        
+        invoice_data = []
+        for invoice in unpaid_invoices:
+            # Calculate days overdue safely
+            days_overdue = 0
+            if invoice.due_date:
+                days_overdue = (timezone.now().date() - invoice.due_date).days
+            
+            invoice_data.append({
+                'id': invoice.id,
+                'invoice_number': invoice.invoice_number,
+                'invoice_date': str(invoice.invoice_date),
+                'due_date': str(invoice.due_date) if invoice.due_date else None,
+                'amount': str(invoice.invoice_amount),
+                'status': invoice.status,
+                'days_overdue': max(0, days_overdue),
+                'customer_name': customer.display_name
+            })
+        
+        total_amount = sum(Decimal(inv['amount']) for inv in invoice_data)
+        
+        return Response({
+            'customer': {
+                'id': customer.id,
+                'name': customer.display_name,
+                'code': customer.party_code
+            },
+            'unpaid_invoices': invoice_data,
+            'total_count': len(invoice_data),
+            'total_amount': str(total_amount)
+        })
+        
+    except Party.DoesNotExist:
+        return Response({'error': 'Customer not found'}, status=404)
+    except Exception as e:
+        logger.error(f"Failed to get unpaid invoices: {e}", exc_info=True)
+        return Response({
+            'error': 'Failed to retrieve unpaid invoices'
+        }, status=500)
+
+# Add this to views.py
+
+@api_view(['GET'])
+def reconciliation_dashboard_data(request):
+    """Get comprehensive data for reconciliation dashboard with filtering"""
+    tenant = get_current_tenant()
+    if not tenant:
+        return Response({'error': 'No tenant context'}, status=400)
+    
+    # Get filter parameters
+    customer_id = request.query_params.get('customer_id')
+    start_date = request.query_params.get('start_date')
+    end_date = request.query_params.get('end_date')
+    status_filter = request.query_params.get('status')
+    
+    # Base queries
+    invoices_query = CustomerInvoice.objects.filter(tenant=tenant, is_active=True)
+    payment_advices_query = PaymentAdvice.objects.filter(tenant=tenant, is_active=True)
+    customer_pos_query = CustomerPurchaseOrder.objects.filter(tenant=tenant, is_active=True)
+    
+    # Apply filters
+    if customer_id:
+        invoices_query = invoices_query.filter(customer_id=customer_id)
+        payment_advices_query = payment_advices_query.filter(customer_id=customer_id)
+        customer_pos_query = customer_pos_query.filter(customer_id=customer_id)
+    
+    if start_date:
+        invoices_query = invoices_query.filter(invoice_date__gte=start_date)
+        payment_advices_query = payment_advices_query.filter(advice_date__gte=start_date)
+        customer_pos_query = customer_pos_query.filter(po_date__gte=start_date)
+    
+    if end_date:
+        invoices_query = invoices_query.filter(invoice_date__lte=end_date)
+        payment_advices_query = payment_advices_query.filter(advice_date__lte=end_date)
+        customer_pos_query = customer_pos_query.filter(po_date__lte=end_date)
+    
+    if status_filter:
+        invoices_query = invoices_query.filter(status=status_filter)
+    
+    # Get data with relationships
+    invoices = invoices_query.select_related('customer', 'reference_customer_po').order_by('-invoice_date')
+    payment_advices = payment_advices_query.select_related('customer').prefetch_related('mentioned_invoices').order_by('-advice_date')
+    customer_pos = customer_pos_query.select_related('customer').order_by('-po_date')
+    
+    # Serialize data
+    invoice_data = []
+    for inv in invoices:
+        # Get related payment advices
+        related_payments = PaymentAdviceInvoice.objects.filter(invoice=inv).select_related('payment_advice')
+        payments_info = [{
+            'advice_number': pa.payment_advice.advice_number,
+            'advice_date': str(pa.payment_advice.advice_date),
+            'amount': str(pa.amount_mentioned)
+        } for pa in related_payments]
+        
+        invoice_data.append({
+            'id': inv.id,
+            'invoice_number': inv.invoice_number,
+            'customer_name': inv.customer.display_name,
+            'customer_id': inv.customer.id,
+            'invoice_date': str(inv.invoice_date),
+            'due_date': str(inv.due_date) if inv.due_date else None,
+            'amount': str(inv.invoice_amount),
+            'status': inv.status,
+            'customer_po_number': inv.reference_customer_po.po_number if inv.reference_customer_po else None,
+            'document_url': inv.invoice_document.url if inv.invoice_document else None,
+            'related_payments': payments_info,
+            'total_paid': str(sum(Decimal(p['amount']) for p in payments_info)),
+            'balance': str(inv.invoice_amount - sum(Decimal(p['amount']) for p in payments_info))
+        })
+    
+    payment_advice_data = []
+    for pa in payment_advices:
+        linked_invoices = PaymentAdviceInvoice.objects.filter(payment_advice=pa).select_related('invoice')
+        invoices_info = [{
+            'invoice_number': pai.invoice.invoice_number,
+            'invoice_date': str(pai.invoice.invoice_date),
+            'amount': str(pai.amount_mentioned)
+        } for pai in linked_invoices]
+        
+        payment_advice_data.append({
+            'id': pa.id,
+            'advice_number': pa.advice_number,
+            'customer_name': pa.customer.display_name,
+            'customer_id': pa.customer.id,
+            'advice_date': str(pa.advice_date),
+            'total_amount': str(pa.total_payment_amount),
+            'document_url': pa.advice_document.url if pa.advice_document else None,
+            'linked_invoices': invoices_info,
+            'total_allocated': str(sum(Decimal(i['amount']) for i in invoices_info)),
+            'unallocated': str(pa.total_payment_amount - sum(Decimal(i['amount']) for i in invoices_info)),
+            'notes': pa.notes
+        })
+    
+    customer_po_data = []
+    for cpo in customer_pos:
+        related_invoices = CustomerInvoice.objects.filter(reference_customer_po=cpo)
+        invoices_info = [{
+            'invoice_number': inv.invoice_number,
+            'amount': str(inv.invoice_amount),
+            'status': inv.status
+        } for inv in related_invoices]
+        
+        customer_po_data.append({
+            'id': cpo.id,
+            'po_number': cpo.po_number,
+            'customer_name': cpo.customer.display_name,
+            'customer_id': cpo.customer.id,
+            'po_date': str(cpo.po_date),
+            'po_amount': str(cpo.po_amount),
+            'status': cpo.status,
+            'document_url': cpo.po_document.url if cpo.po_document else None,
+            'related_invoices': invoices_info,
+            'total_invoiced': str(sum(Decimal(i['amount']) for i in invoices_info))
+        })
+    
+    # Calculate summary statistics
+    total_invoices = len(invoice_data)
+    total_invoice_amount = sum(Decimal(inv['amount']) for inv in invoice_data)
+    total_paid_amount = sum(Decimal(inv['total_paid']) for inv in invoice_data)
+    total_outstanding = total_invoice_amount - total_paid_amount
+    
+    return Response({
+        'invoices': invoice_data,
+        'payment_advices': payment_advice_data,
+        'customer_pos': customer_po_data,
+        'summary': {
+            'total_invoices': total_invoices,
+            'total_invoice_amount': str(total_invoice_amount),
+            'total_paid': str(total_paid_amount),
+            'total_outstanding': str(total_outstanding),
+            'total_payment_advices': len(payment_advice_data),
+            'total_customer_pos': len(customer_po_data)
+        }
+    })
+
+
+@api_view(['POST'])
+def reconcile_invoice_numbers(request):
+    """
+    Reconcile manually entered invoice numbers with system invoices
+    Supports date range filtering for invoice lookup
+    """
+    tenant = get_current_tenant()
+    if not tenant:
+        return Response({'error': 'No tenant context'}, status=400)
+    
+    customer_id = request.data.get('customer_id')
+    invoice_entries = request.data.get('invoice_entries', [])  # [{"invoice_number": "INV-001", "amount": "5000"}, ...]
+    date_range_days = request.data.get('date_range_days', 180)
+    start_date = request.data.get('start_date')  # Optional custom start date
+    end_date = request.data.get('end_date')  # Optional custom end date
+    
+    if not customer_id or not invoice_entries:
+        return Response({
+            'error': 'customer_id and invoice_entries are required'
+        }, status=400)
+    
+    try:
+        customer = Party.objects.get(id=customer_id, tenant=tenant, party_type='customer')
+        
+        # Build date filter
+        if end_date:
+            end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+        else:
+            end_date = timezone.now().date()
+        
+        if start_date:
+            start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        else:
+            start_date = end_date - timedelta(days=date_range_days)
+        
+        # Get system invoices in date range
+        system_invoices = CustomerInvoice.objects.filter(
+            tenant=tenant,
+            customer=customer,
+            is_active=True,
+            invoice_date__gte=start_date,
+            invoice_date__lte=end_date,
+            status__in=['sent', 'partial_paid', 'overdue']
+        ).order_by('invoice_date')
+        
+        reconciliation_service = ReconciliationService(tenant)
+        
+        # Process each entered invoice
+        matched_invoices = []
+        unmatched_entries = []
+        
+        for entry in invoice_entries:
+            invoice_number = entry.get('invoice_number', '').strip()
+            amount = entry.get('amount', '')
+            
+            if not invoice_number:
+                continue
+            
+            # Try to find matching invoice
+            matched_invoice = reconciliation_service.fuzzy_match_invoice_number(
+                invoice_number, 
+                list(system_invoices)
+            )
+            
+            if matched_invoice:
+                # Calculate amount discrepancy if amount provided
+                amount_discrepancy = None
+                if amount:
+                    try:
+                        entered_amount = Decimal(str(amount).replace(',', ''))
+                        invoice_amount = matched_invoice.invoice_amount
+                        
+                        if abs(entered_amount - invoice_amount) > Decimal('0.01'):
+                            amount_discrepancy = {
+                                'invoice_amount': str(invoice_amount),
+                                'entered_amount': str(entered_amount),
+                                'difference': str(invoice_amount - entered_amount)
+                            }
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Invalid amount format: {amount}")
+                
+                days_overdue = 0
+                if matched_invoice.due_date:
+                    days_overdue = (timezone.now().date() - matched_invoice.due_date).days
+                
+                matched_invoices.append({
+                    'invoice_id': matched_invoice.id,
+                    'invoice_number': matched_invoice.invoice_number,
+                    'entered_number': invoice_number,
+                    'invoice_date': str(matched_invoice.invoice_date),
+                    'due_date': str(matched_invoice.due_date) if matched_invoice.due_date else None,
+                    'invoice_amount': str(matched_invoice.invoice_amount),
+                    'entered_amount': amount,
+                    'amount_discrepancy': amount_discrepancy,
+                    'status': matched_invoice.status,
+                    'days_overdue': max(0, days_overdue),
+                    'match_quality': 'exact' if reconciliation_service.normalize_invoice_number(invoice_number) == 
+                                     reconciliation_service.normalize_invoice_number(matched_invoice.invoice_number) 
+                                     else 'fuzzy'
+                })
+            else:
+                unmatched_entries.append({
+                    'entered_number': invoice_number,
+                    'entered_amount': amount,
+                    'reason': 'No matching invoice found in system'
+                })
+        
+        # Find missing invoices (in system but not in entered list)
+        matched_invoice_ids = {m['invoice_id'] for m in matched_invoices}
+        missing_invoices = []
+        
+        for invoice in system_invoices:
+            if invoice.id not in matched_invoice_ids:
+                days_overdue = 0
+                if invoice.due_date:
+                    days_overdue = (timezone.now().date() - invoice.due_date).days
+                
+                missing_invoices.append({
+                    'invoice_id': invoice.id,
+                    'invoice_number': invoice.invoice_number,
+                    'invoice_date': str(invoice.invoice_date),
+                    'due_date': str(invoice.due_date) if invoice.due_date else None,
+                    'invoice_amount': str(invoice.invoice_amount),
+                    'status': invoice.status,
+                    'days_overdue': max(0, days_overdue),
+                    'aging_bucket': reconciliation_service._get_aging_bucket(days_overdue)
+                })
+        
+        # Calculate totals
+        total_matched_amount = sum(Decimal(m['invoice_amount']) for m in matched_invoices)
+        total_missing_amount = sum(Decimal(m['invoice_amount']) for m in missing_invoices)
+        total_entered_amount = sum(
+            Decimal(str(m['entered_amount']).replace(',', '')) 
+            for m in matched_invoices if m['entered_amount']
+        )
+        
+        # Generate recommendations
+        recommendations = []
+        
+        if missing_invoices:
+            recommendations.append({
+                'type': 'warning',
+                'message': f'{len(missing_invoices)} invoices (₹{total_missing_amount:,.2f}) missing from payment advice',
+                'action': 'Contact customer accounts department'
+            })
+        
+        if unmatched_entries:
+            recommendations.append({
+                'type': 'error',
+                'message': f'{len(unmatched_entries)} invoice numbers not found in system',
+                'action': 'Verify invoice numbers with customer'
+            })
+        
+        discrepancy_count = sum(1 for m in matched_invoices if m.get('amount_discrepancy'))
+        if discrepancy_count:
+            recommendations.append({
+                'type': 'warning',
+                'message': f'{discrepancy_count} invoices have amount discrepancies',
+                'action': 'Review and confirm amounts with customer'
+            })
+        
+        critical_overdue = [m for m in missing_invoices if m['days_overdue'] > 90]
+        if critical_overdue:
+            recommendations.append({
+                'type': 'critical',
+                'message': f'{len(critical_overdue)} missing invoices are 90+ days overdue',
+                'action': 'Escalate immediately'
+            })
+        
+        if not recommendations:
+            recommendations.append({
+                'type': 'success',
+                'message': 'All invoices reconciled successfully',
+                'action': 'No action required'
+            })
+        
+        return Response({
+            'success': True,
+            'reconciliation': {
+                'date_range': {
+                    'start_date': str(start_date),
+                    'end_date': str(end_date)
+                },
+                'customer': {
+                    'id': customer.id,
+                    'name': customer.display_name,
+                    'code': customer.party_code
+                },
+                'summary': {
+                    'total_system_invoices': system_invoices.count(),
+                    'total_entered': len(invoice_entries),
+                    'total_matched': len(matched_invoices),
+                    'total_missing': len(missing_invoices),
+                    'total_unmatched': len(unmatched_entries),
+                    'matched_amount': str(total_matched_amount),
+                    'missing_amount': str(total_missing_amount),
+                    'entered_amount': str(total_entered_amount)
+                },
+                'matched_invoices': matched_invoices,
+                'missing_invoices': missing_invoices,
+                'unmatched_entries': unmatched_entries,
+                'recommendations': recommendations
+            }
+        })
+        
+    except Party.DoesNotExist:
+        return Response({'error': 'Customer not found'}, status=404)
+    except Exception as e:
+        logger.error(f"Reconciliation failed: {e}", exc_info=True)
+        return Response({
+            'success': False,
+            'error': str(e)
+        }, status=500)
+
+
+@api_view(['POST'])
+def save_reconciliation(request):
+    """
+    Save confirmed reconciliation and create payment advice
+    """
+    tenant = get_current_tenant()
+    if not tenant:
+        return Response({'error': 'No tenant context'}, status=400)
+    
+    customer_id = request.data.get('customer_id')
+    advice_number = request.data.get('advice_number')
+    advice_date = request.data.get('advice_date')
+    total_amount = request.data.get('total_amount')
+    matched_invoices = request.data.get('matched_invoices', [])
+    notes = request.data.get('notes', '')
+    
+    if not all([customer_id, advice_date, total_amount]):
+        return Response({'error': 'Missing required fields'}, status=400)
+    
+    try:
+        customer = Party.objects.get(id=customer_id, tenant=tenant, party_type='customer')
+        
+        # Auto-generate advice number if not provided
+        if not advice_number:
+            last_advice = PaymentAdvice.objects.filter(tenant=tenant).order_by('-id').first()
+            advice_number = f"PA-{timezone.now().strftime('%Y%m')}-{(last_advice.id + 1) if last_advice else 1:04d}"
+        
+        # Parse date and amount
+        advice_date = datetime.strptime(advice_date, '%Y-%m-%d').date()
+        total_amount = Decimal(str(total_amount).replace(',', ''))
+        
+        # Prepare invoice data
+        matched_invoice_ids = [inv['invoice_id'] for inv in matched_invoices]
+        invoice_amounts = {}
+        
+        for inv in matched_invoices:
+            invoice_id = inv['invoice_id']
+            amount = inv.get('entered_amount') or inv.get('invoice_amount')
+            try:
+                invoice_amounts[invoice_id] = Decimal(str(amount).replace(',', ''))
+            except:
+                # Use invoice's actual amount as fallback
+                invoice = CustomerInvoice.objects.get(id=invoice_id, tenant=tenant)
+                invoice_amounts[invoice_id] = invoice.invoice_amount
+        
+        # Create payment advice
+        reconciliation_service = ReconciliationService(tenant)
+        payment_advice, summary = reconciliation_service.create_payment_advice_with_reconciliation(
+            customer=customer,
+            advice_number=advice_number,
+            advice_date=advice_date,
+            total_payment_amount=total_amount,
+            matched_invoice_ids=matched_invoice_ids,
+            invoice_amounts=invoice_amounts,
+            created_by=request.user,
+            notes=notes
+        )
+        
+        return Response({
+            'success': True,
+            'payment_advice_id': payment_advice.id,
+            'advice_number': payment_advice.advice_number,
+            'message': 'Reconciliation saved successfully'
+        })
+        
+    except Exception as e:
+        logger.error(f"Save reconciliation failed: {e}", exc_info=True)
+        return Response({
+            'success': False,
+            'error': str(e)
+        }, status=500)
