@@ -2,10 +2,11 @@
 
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from django.db.models import Sum, Avg, Count, Q, F, Case, When
+from django.db.models import Sum, Avg, Count, Q, F, Case, When, Window
 from django.utils import timezone
 from datetime import datetime, timedelta
 from decimal import Decimal
+from rest_framework.decorators import action
 import logging
 from django.shortcuts import get_object_or_404
 from rest_framework import status
@@ -1821,3 +1822,251 @@ def overdue_work_orders(request):
         'count': len(orders_data),
         'orders': orders_data
     })
+
+@api_view(['GET'])
+def equipment_work_order_history(request, equipment_id=None):
+    """Get detailed work order history for equipment with comprehensive work order analytics"""
+    tenant = get_current_tenant()
+    if not tenant:
+        return Response({'error': 'No tenant context'}, status=400)
+    
+    # Parse date range or use default (last 90 days for work orders)
+    start_date, end_date = parse_date_range(request, 90)
+    if start_date is None:
+        return Response({'error': 'Invalid date format (use YYYY-MM-DD)'}, status=400)
+    
+    try:
+        if equipment_id:
+            # Single equipment detail
+            equipment = get_object_or_404(Equipment, id=equipment_id, tenant=tenant)
+            equipment_list = [equipment]
+        else:
+            # All equipment
+            equipment_list = Equipment.objects.filter(tenant=tenant, is_active=True)
+        
+        equipment_work_orders = []
+        
+        for equipment in equipment_list:
+            # Get all production entries for this equipment to find associated work orders
+            production_entries = ProductionEntry.objects.filter(
+                tenant=tenant,
+                equipment=equipment,
+                entry_datetime__date__range=[start_date, end_date]
+            ).select_related('work_order', 'work_order__product', 'work_order__cost_center')
+            
+            # Get unique work orders from production entries
+            work_order_ids = production_entries.values_list('work_order_id', flat=True).distinct()
+            work_orders = WorkOrder.objects.filter(
+                id__in=work_order_ids,
+                tenant=tenant
+            ).select_related('product', 'cost_center')
+            
+            work_order_details = []
+            
+            for wo in work_orders:
+                # Get production entries specific to this work order and equipment
+                wo_entries = production_entries.filter(work_order=wo)
+                
+                # Calculate work order metrics
+                total_produced = wo_entries.aggregate(Sum('quantity_produced'))['quantity_produced__sum'] or 0
+                total_rejected = wo_entries.aggregate(Sum('quantity_rejected'))['quantity_rejected__sum'] or 0
+                total_downtime = wo_entries.aggregate(Sum('downtime_minutes'))['downtime_minutes__sum'] or 0
+                entry_count = wo_entries.count()
+                
+                # Calculate duration on this equipment
+                if wo_entries.exists():
+                    first_entry = wo_entries.earliest('entry_datetime')
+                    last_entry = wo_entries.latest('entry_datetime')
+                    duration_hours = (last_entry.entry_datetime - first_entry.entry_datetime).total_seconds() / 3600
+                else:
+                    duration_hours = 0
+                
+                # Calculate efficiency metrics
+                theoretical_hours = total_produced / equipment.capacity_per_hour if equipment.capacity_per_hour > 0 else 0
+                equipment_efficiency = (theoretical_hours / max(duration_hours, 1)) * 100 if duration_hours > 0 else 0
+                quality_rate = (total_produced / max(total_produced + total_rejected, 1)) * 100
+                
+                # Get production timeline
+                production_timeline = []
+                for entry in wo_entries.order_by('entry_datetime'):
+                    production_timeline.append({
+                        'entry_id': entry.id,
+                        'entry_datetime': entry.entry_datetime.isoformat(),
+                        'quantity_produced': float(entry.quantity_produced),
+                        'quantity_rejected': float(entry.quantity_rejected),
+                        'downtime_minutes': entry.downtime_minutes,
+                        'operator': entry.operator.full_name if entry.operator else 'N/A',
+                        'shift': entry.shift
+                    })
+                
+                # Calculate completion percentage for this equipment's contribution
+                equipment_completion_pct = (total_produced / max(wo.quantity_planned, 1)) * 100
+                
+                work_order_details.append({
+                    'work_order_id': wo.id,
+                    'wo_number': wo.wo_number,
+                    'product_sku': wo.product.sku,
+                    'product_name': wo.product.product_name,
+                    'cost_center': wo.cost_center.name,
+                    'status': wo.status,
+                    'quantity_planned': float(wo.quantity_planned),
+                    'quantity_completed': float(wo.quantity_completed or 0),
+                    'due_date': wo.due_date.isoformat() if wo.due_date else None,
+                    'priority': wo.priority,
+                    'equipment_performance': {
+                        'total_produced_on_equipment': float(total_produced),
+                        'total_rejected_on_equipment': float(total_rejected),
+                        'production_entries_count': entry_count,
+                        'total_downtime_minutes': total_downtime,
+                        'duration_hours_on_equipment': round(duration_hours, 2),
+                        'equipment_efficiency_pct': round(equipment_efficiency, 2),
+                        'quality_rate_pct': round(quality_rate, 2),
+                        'utilization_rate': (duration_hours / max(((wo.due_date - wo.created_at.date()).days * 24), 1)) * 100 if wo.due_date and wo.created_at else 0
+                    },
+                    'production_timeline': production_timeline,
+                    'completion_percentage': round(equipment_completion_pct, 2),
+                    'start_date': wo_entries.earliest('entry_datetime').entry_datetime.date().isoformat() if wo_entries.exists() else None,
+                    'end_date': wo_entries.latest('entry_datetime').entry_datetime.date().isoformat() if wo_entries.exists() else None
+                })
+            
+            # Sort work orders by start date (most recent first)
+            work_order_details.sort(key=lambda x: x['start_date'] or '', reverse=True)
+            
+            # Calculate equipment summary
+            total_work_orders = len(work_order_details)
+            completed_work_orders = len([wo for wo in work_order_details if wo['status'] == 'completed'])
+            total_production = sum(wo['equipment_performance']['total_produced_on_equipment'] for wo in work_order_details)
+            avg_efficiency = sum(wo['equipment_performance']['equipment_efficiency_pct'] for wo in work_order_details) / max(total_work_orders, 1)
+            
+            equipment_data = {
+                'equipment_id': equipment.id,
+                'equipment_code': equipment.equipment_code,
+                'equipment_name': equipment.equipment_name,
+                'capacity_per_hour': equipment.capacity_per_hour,
+                'period': {
+                    'start_date': start_date.isoformat(),
+                    'end_date': end_date.isoformat()
+                },
+                'summary': {
+                    'total_work_orders': total_work_orders,
+                    'completed_work_orders': completed_work_orders,
+                    'completion_rate': round((completed_work_orders / max(total_work_orders, 1)) * 100, 2),
+                    'total_production': float(total_production),
+                    'avg_efficiency_pct': round(avg_efficiency, 2),
+                    'active_work_orders': len([wo for wo in work_order_details if wo['status'] in ['released', 'in_progress']])
+                },
+                'work_orders': work_order_details
+            }
+            
+            equipment_work_orders.append(equipment_data)
+        
+        # Return appropriate response format
+        if equipment_id and equipment_work_orders:
+            return Response(equipment_work_orders[0])
+        else:
+            return Response({
+                'period': {'start_date': start_date.isoformat(), 'end_date': end_date.isoformat()},
+                'total_equipment': len(equipment_work_orders),
+                'equipment_work_orders': equipment_work_orders
+            })
+            
+    except Exception as e:
+        logger.error(f"Equipment work order history error: {str(e)}", exc_info=True)
+        return Response({'error': f'Failed to retrieve equipment work order history: {str(e)}'}, status=500)
+
+@api_view(['GET'])
+def work_order_equipment_performance(request, wo_id):
+    """Compare how a specific work order performed across different equipment"""
+    tenant = get_current_tenant()
+    if not tenant:
+        return Response({'error': 'No tenant context'}, status=400)
+    
+    try:
+        work_order = get_object_or_404(WorkOrder, id=wo_id, tenant=tenant)
+        
+        # Get all production entries for this work order
+        production_entries = ProductionEntry.objects.filter(
+            tenant=tenant,
+            work_order=work_order
+        ).select_related('equipment', 'operator')
+        
+        # Group by equipment
+        equipment_performance = {}
+        
+        for entry in production_entries:
+            equip_id = entry.equipment.id
+            if equip_id not in equipment_performance:
+                equipment_performance[equip_id] = {
+                    'equipment': entry.equipment,
+                    'entries': [],
+                    'total_produced': 0,
+                    'total_rejected': 0,
+                    'total_downtime': 0
+                }
+            
+            equipment_performance[equip_id]['entries'].append(entry)
+            equipment_performance[equip_id]['total_produced'] += entry.quantity_produced
+            equipment_performance[equip_id]['total_rejected'] += entry.quantity_rejected
+            equipment_performance[equip_id]['total_downtime'] += entry.downtime_minutes
+        
+        # Build performance comparison
+        performance_data = []
+        
+        for equip_id, data in equipment_performance.items():
+            equipment = data['equipment']
+            total_produced = data['total_produced']
+            total_rejected = data['total_rejected']
+            entry_count = len(data['entries'])
+            
+            # Calculate metrics
+            duration_hours = entry_count  # Assuming 1 entry per hour
+            efficiency = (total_produced / max(equipment.capacity_per_hour * duration_hours, 1)) * 100
+            quality_rate = (total_produced / max(total_produced + total_rejected, 1)) * 100
+            
+            # Timeline
+            if data['entries']:
+                first_entry = min(data['entries'], key=lambda x: x.entry_datetime)
+                last_entry = max(data['entries'], key=lambda x: x.entry_datetime)
+                timeline = f"{first_entry.entry_datetime.strftime('%Y-%m-%d %H:%M')} to {last_entry.entry_datetime.strftime('%Y-%m-%d %H:%M')}"
+            else:
+                timeline = "N/A"
+            
+            performance_data.append({
+                'equipment_id': equipment.id,
+                'equipment_code': equipment.equipment_code,
+                'equipment_name': equipment.equipment_name,
+                'production_share_pct': (total_produced / max(work_order.quantity_completed, 1)) * 100,
+                'total_produced': float(total_produced),
+                'total_rejected': float(total_rejected),
+                'entry_count': entry_count,
+                'efficiency_pct': round(efficiency, 2),
+                'quality_rate_pct': round(quality_rate, 2),
+                'avg_hourly_output': total_produced / max(entry_count, 1),
+                'timeline': timeline,
+                'downtime_minutes': data['total_downtime']
+            })
+        
+        # Sort by production share (highest first)
+        performance_data.sort(key=lambda x: x['production_share_pct'], reverse=True)
+        
+        return Response({
+            'work_order': {
+                'id': work_order.id,
+                'wo_number': work_order.wo_number,
+                'product_sku': work_order.product.sku,
+                'product_name': work_order.product.product_name,
+                'quantity_planned': float(work_order.quantity_planned),
+                'quantity_completed': float(work_order.quantity_completed or 0),
+                'status': work_order.status
+            },
+            'equipment_performance': performance_data,
+            'summary': {
+                'total_equipment_used': len(performance_data),
+                'primary_equipment': performance_data[0]['equipment_name'] if performance_data else 'N/A',
+                'avg_efficiency_across_equipment': sum(x['efficiency_pct'] for x in performance_data) / max(len(performance_data), 1)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Work order equipment performance error: {str(e)}")
+        return Response({'error': 'Failed to retrieve work order equipment performance'}, status=500)

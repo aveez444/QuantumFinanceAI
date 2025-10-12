@@ -6,6 +6,15 @@ from .views import CreateTenantView, LoginView, LogoutView, GetCSRFTokenView, Pu
 from . import views, business_views
 from .business_views import *  # Import from business_views
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+# --- Production Analytics API ---
+from .production_analytics_api import (
+    production_summary,
+    employee_production_detail,
+    equipment_production_detail,
+    workorder_production_detail,
+    production_dashboard,
+)
+
 
 # Create router for ViewSets
 router = DefaultRouter()
@@ -25,6 +34,7 @@ router.register(r'employee-documents', views.EmployeeDocumentViewSet, basename='
 router.register(r'customer-invoices', views.CustomerInvoiceViewSet, basename='customer-invoices')
 router.register(r'customer-pos', views.CustomerPurchaseOrderViewSet, basename='customer-pos')
 router.register(r'payment-advices', views.PaymentAdviceViewSet, basename='payment-advices')
+
 
 urlpatterns = [
     path("create-tenant/", CreateTenantView.as_view(), name="create-tenant"),
@@ -107,9 +117,26 @@ business_patterns = [
     # Dashboard Alerts
     path('dashboard/alerts/', dashboard_alerts, name='dashboard-alerts'),
 
+    path('equipment/work-order-history/', equipment_work_order_history, name='equipment-work-order-history'),
+    path('equipment/<int:equipment_id>/work-order-history/', equipment_work_order_history, name='equipment-work-order-history-detail'),
+    
+    # Work order equipment performance
+    path('work-orders/<int:wo_id>/equipment-performance/', work_order_equipment_performance, name='work-order-equipment-performance'),
+
     path('business-overview/', business_views.business_overview_dashboard, name='business-overview-dashboard'),
     # In urls.py - business_patterns
     path('operations/overdue-work-orders/', overdue_work_orders, name='overdue-work-orders'),
+
+    # Production Analytics & Insights
+    path('analytics/production-summary/', production_summary, name='production-summary'),
+    path('analytics/employees/', employee_production_detail, name='employee-production-list'),
+    path('analytics/employees/<int:employee_id>/', employee_production_detail, name='employee-production-detail'),
+    path('analytics/equipment/', equipment_production_detail, name='equipment-production-list'),
+    path('analytics/equipment/<int:equipment_id>/', equipment_production_detail, name='equipment-production-detail'),
+    path('analytics/workorders/', workorder_production_detail, name='workorder-production-list'),
+    path('analytics/workorders/<int:workorder_id>/', workorder_production_detail, name='workorder-production-detail'),
+    path('analytics/dashboard/', production_dashboard, name='production-dashboard'),
+
 
 ]
 
