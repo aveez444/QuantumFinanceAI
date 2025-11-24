@@ -260,7 +260,7 @@ class WorkOrderSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.product_name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
     cost_center_name = serializers.CharField(source='cost_center.name', read_only=True)
-    completion_percentage = serializers.ReadOnlyField()
+    completion_percentage = serializers.SerializerMethodField(read_only=True)
     efficiency_rate = serializers.SerializerMethodField()
     
     class Meta:
@@ -269,23 +269,41 @@ class WorkOrderSerializer(serializers.ModelSerializer):
             'id', 'wo_number', 'product', 'product_name', 'product_sku',
             'quantity_planned', 'quantity_completed', 'quantity_scrapped',
             'due_date', 'status', 'cost_center', 'cost_center_name', 'priority',
-            'completion_percentage', 'efficiency_rate', 'created_at', 'updated_at'
+            'description',        
+            'completion_percentage', 'efficiency_rate',
+            'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'wo_number', 'completion_percentage', 'created_at', 'updated_at']
-    
+
+    def get_completion_percentage(self, obj):
+        if obj.quantity_planned and obj.quantity_planned > 0:
+            return round((obj.quantity_completed / obj.quantity_planned) * 100, 2)
+        return 0.0
+
     def get_efficiency_rate(self, obj):
         """Calculate current efficiency rate"""
-        if obj.quantity_planned > 0 and obj.quantity_completed > 0:
-            # Get actual vs planned time (simplified calculation)
-            from django.utils import timezone
-            days_elapsed = (timezone.now().date() - obj.created_at.date()).days + 1
-            days_planned = (obj.due_date - obj.created_at.date()).days + 1
-            
-            time_efficiency = (days_planned / max(days_elapsed, 1)) * 100
+        try:
+            if not obj.quantity_planned or obj.quantity_planned <= 0:
+                return 0.0
+
+            # Ensure created_at is a date for subtraction
+            created_date = obj.created_at.date() if hasattr(obj.created_at, 'date') else obj.created_at
+            if obj.due_date is None:
+                return 0.0
+
+            days_elapsed = (timezone.now().date() - created_date).days + 1
+            days_planned = (obj.due_date - created_date).days + 1
+
+            # protect against zero or negative
+            days_elapsed = max(days_elapsed, 1)
+            days_planned = max(days_planned, 1)
+
+            time_efficiency = (days_planned / days_elapsed) * 100
             qty_efficiency = (obj.quantity_completed / obj.quantity_planned) * 100
-            
+
             return round(min(time_efficiency, qty_efficiency), 2)
-        return 0
+        except Exception:
+            return 0.0
 
 class ProductionEntrySerializer(serializers.ModelSerializer):
     """Production entry with validation"""
