@@ -136,6 +136,7 @@ business_patterns = [
     path('analytics/workorders/', workorder_production_detail, name='workorder-production-list'),
     path('analytics/workorders/<int:workorder_id>/', workorder_production_detail, name='workorder-production-detail'),
     path('analytics/dashboard/', production_dashboard, name='production-dashboard'),
+    path('analytics/detailed-analytics/', detailed_analytics, name='detailed_analytics'),
 
 
 ]
