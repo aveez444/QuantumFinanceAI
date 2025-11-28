@@ -2070,3 +2070,424 @@ def work_order_equipment_performance(request, wo_id):
     except Exception as e:
         logger.error(f"Work order equipment performance error: {str(e)}")
         return Response({'error': 'Failed to retrieve work order equipment performance'}, status=500)
+
+@api_view(['GET'])
+def detailed_analytics(request):
+    """Detailed analytics for production intelligence dashboard"""
+    tenant = get_current_tenant()
+    if not tenant:
+        return Response({'error': 'No tenant context'}, status=400)
+    
+    # Parse date range or use default
+    start_date, end_date = parse_date_range(request, 30)
+    if start_date is None:
+        return Response({'error': 'Invalid date format (use YYYY-MM-DD)'}, status=400)
+    
+    timeframe = request.query_params.get('timeframe', '30d')
+    
+    try:
+        # 1. Production Trend Data
+        production_trend = get_production_trend_data(tenant, start_date, end_date, timeframe)
+        
+        # 2. Quality vs Efficiency Correlation
+        quality_efficiency_correlation = get_quality_efficiency_correlation(tenant, start_date, end_date)
+        
+        # 3. Downtime Breakdown
+        downtime_breakdown = get_downtime_breakdown(tenant, start_date, end_date)
+        
+        # 4. Performance Radar Data
+        performance_radar = get_performance_radar_data(tenant, start_date, end_date)
+        
+        # 5. Overall Metrics
+        overall_metrics = get_overall_analytics_metrics(tenant, start_date, end_date)
+        
+        # 6. Real-time Insights
+        real_time_insights = get_real_time_insights(tenant, start_date, end_date)
+        
+        # 7. Alerts
+        alerts = get_analytics_alerts(tenant, start_date, end_date)
+        
+        return Response({
+            'production_trend': production_trend,
+            'quality_efficiency_correlation': quality_efficiency_correlation,
+            'downtime_breakdown': downtime_breakdown,
+            'performance_radar': performance_radar,
+            'overall_efficiency': overall_metrics['overall_efficiency'],
+            'quality_trend': overall_metrics['quality_trend'],
+            'productivity_index': overall_metrics['productivity_index'],
+            'utilization_rate': overall_metrics['utilization_rate'],
+            'performance_score': overall_metrics['performance_score'],
+            'real_time_insights': real_time_insights,
+            'alerts': alerts,
+            'period': {
+                'start_date': start_date.isoformat(),
+                'end_date': end_date.isoformat(),
+                'timeframe': timeframe
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Detailed analytics error: {str(e)}", exc_info=True)
+        return Response({'error': f'Failed to generate detailed analytics: {str(e)}'}, status=500)
+
+# ===== HELPER FUNCTIONS FOR DETAILED ANALYTICS =====
+
+def get_production_trend_data(tenant, start_date, end_date, timeframe):
+    """Generate production trend data for charts"""
+    production_entries = ProductionEntry.objects.filter(
+        tenant=tenant,
+        entry_datetime__date__range=[start_date, end_date]
+    ).select_related('work_order__product', 'equipment')
+    
+    # Group by date based on timeframe
+    trend_data = []
+    current_date = start_date
+    
+    if timeframe in ['7d', '30d']:
+        # Daily data
+        while current_date <= end_date:
+            day_entries = production_entries.filter(entry_datetime__date=current_date)
+            produced = day_entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+            rejected = day_entries.aggregate(total=Sum('quantity_rejected'))['total'] or 0
+            
+            # Calculate target based on equipment capacity
+            total_capacity = Equipment.objects.filter(
+                tenant=tenant, is_active=True
+            ).aggregate(total=Sum('capacity_per_hour'))['total'] or 0
+            target = total_capacity * 8  # Assuming 8-hour shift
+            
+            trend_data.append({
+                'date': current_date.strftime('%b %d'),
+                'production': float(produced),
+                'target': float(target),
+                'rejected': float(rejected)
+            })
+            
+            current_date += timedelta(days=1)
+    
+    else:
+        # Weekly data for longer timeframes
+        current_date = start_date
+        while current_date <= end_date:
+            week_end = min(current_date + timedelta(days=6), end_date)
+            week_entries = production_entries.filter(
+                entry_datetime__date__range=[current_date, week_end]
+            )
+            produced = week_entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+            
+            total_capacity = Equipment.objects.filter(
+                tenant=tenant, is_active=True
+            ).aggregate(total=Sum('capacity_per_hour'))['total'] or 0
+            target = total_capacity * 8 * 7  # 7 days
+            
+            trend_data.append({
+                'date': current_date.strftime('%b %d'),
+                'production': float(produced),
+                'target': float(target),
+                'rejected': 0  # Simplified for weekly view
+            })
+            
+            current_date += timedelta(days=7)
+    
+    return trend_data
+
+def get_quality_efficiency_correlation(tenant, start_date, end_date):
+    """Generate quality vs efficiency correlation data"""
+    equipment_list = Equipment.objects.filter(tenant=tenant, is_active=True)
+    correlation_data = []
+    
+    for equipment in equipment_list:
+        entries = ProductionEntry.objects.filter(
+            tenant=tenant,
+            equipment=equipment,
+            entry_datetime__date__range=[start_date, end_date]
+        )
+        
+        if entries.exists():
+            total_produced = entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+            total_rejected = entries.aggregate(total=Sum('quantity_rejected'))['total'] or 0
+            total_entries = entries.count()
+            
+            # Efficiency: actual production vs theoretical capacity
+            theoretical_capacity = equipment.capacity_per_hour * total_entries
+            efficiency = (total_produced / max(theoretical_capacity, 1)) * 100
+            
+            # Quality rate
+            total_output = total_produced + total_rejected
+            quality = (total_produced / max(total_output, 1)) * 100 if total_output > 0 else 100
+            
+            correlation_data.append({
+                'equipment': equipment.equipment_code,
+                'efficiency': round(efficiency, 2),
+                'quality': round(quality, 2),
+                'production': float(total_produced)
+            })
+    
+    return correlation_data
+
+def get_downtime_breakdown(tenant, start_date, end_date):
+    """Generate downtime breakdown for pie chart"""
+    production_entries = ProductionEntry.objects.filter(
+        tenant=tenant,
+        entry_datetime__date__range=[start_date, end_date],
+        downtime_minutes__gt=0
+    )
+    
+    # Group by downtime reason
+    downtime_data = {}
+    
+    for entry in production_entries:
+        reason = entry.downtime_reason or 'Unspecified'
+        if reason not in downtime_data:
+            downtime_data[reason] = 0
+        downtime_data[reason] += entry.downtime_minutes
+    
+    # Convert to chart format
+    breakdown = []
+    colors = ['#EF4444', '#F59E0B', '#10B981', '#3B82F6', '#8B5CF6']
+    
+    for i, (reason, minutes) in enumerate(downtime_data.items()):
+        breakdown.append({
+            'name': reason,
+            'value': minutes,
+            'color': colors[i % len(colors)]
+        })
+    
+    # If no downtime data, return default
+    if not breakdown:
+        breakdown = [
+            {'name': 'No Downtime', 'value': 1, 'color': '#10B981'}
+        ]
+    
+    return breakdown
+
+def get_performance_radar_data(tenant, start_date, end_date):
+    """Generate performance radar chart data"""
+    # Get overall metrics
+    production_entries = ProductionEntry.objects.filter(
+        tenant=tenant,
+        entry_datetime__date__range=[start_date, end_date]
+    )
+    
+    # Calculate various performance metrics
+    total_produced = production_entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+    total_rejected = production_entries.aggregate(total=Sum('quantity_rejected'))['total'] or 0
+    total_downtime = production_entries.aggregate(total=Sum('downtime_minutes'))['total'] or 0
+    total_entries = production_entries.count()
+    
+    # Availability
+    total_minutes = total_entries * 60  # Each entry represents an hour
+    availability = ((total_minutes - total_downtime) / total_minutes * 100) if total_minutes > 0 else 0
+    
+    # Performance (throughput efficiency)
+    equipment_capacity = Equipment.objects.filter(tenant=tenant, is_active=True).aggregate(
+        total=Sum('capacity_per_hour')
+    )['total'] or 0
+    theoretical_output = equipment_capacity * total_entries
+    performance = (total_produced / theoretical_output * 100) if theoretical_output > 0 else 0
+    
+    # Quality
+    total_output = total_produced + total_rejected
+    quality = (total_produced / total_output * 100) if total_output > 0 else 100
+    
+    # Utilization
+    total_equipment_hours = Equipment.objects.filter(tenant=tenant, is_active=True).count() * 24 * (end_date - start_date).days
+    utilization = (total_entries / total_equipment_hours * 100) if total_equipment_hours > 0 else 0
+    
+    # OEE
+    oee = (availability * performance * quality) / 10000
+    
+    return [
+        {
+            'subject': 'Availability',
+            'A': round(availability, 1),
+            'B': 85,  # Target
+            'fullMark': 100,
+        },
+        {
+            'subject': 'Performance',
+            'A': round(performance, 1),
+            'B': 80,  # Target
+            'fullMark': 100,
+        },
+        {
+            'subject': 'Quality',
+            'A': round(quality, 1),
+            'B': 95,  # Target
+            'fullMark': 100,
+        },
+        {
+            'subject': 'Utilization',
+            'A': round(utilization, 1),
+            'B': 75,  # Target
+            'fullMark': 100,
+        },
+        {
+            'subject': 'OEE',
+            'A': round(oee, 1),
+            'B': 65,  # Target
+            'fullMark': 100,
+        },
+        {
+            'subject': 'Efficiency',
+            'A': round((availability + performance + quality) / 3, 1),
+            'B': 80,  # Target
+            'fullMark': 100,
+        }
+    ]
+
+def get_overall_analytics_metrics(tenant, start_date, end_date):
+    """Calculate overall analytics metrics"""
+    production_entries = ProductionEntry.objects.filter(
+        tenant=tenant,
+        entry_datetime__date__range=[start_date, end_date]
+    )
+    
+    # Overall efficiency (OEE-like metric)
+    total_produced = production_entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+    total_rejected = production_entries.aggregate(total=Sum('quantity_rejected'))['total'] or 0
+    total_downtime = production_entries.aggregate(total=Sum('downtime_minutes'))['total'] or 0
+    total_entries = production_entries.count()
+    
+    # Simplified overall efficiency calculation
+    total_output = total_produced + total_rejected
+    quality_rate = (total_produced / total_output * 100) if total_output > 0 else 100
+    
+    equipment_capacity = Equipment.objects.filter(tenant=tenant, is_active=True).aggregate(
+        total=Sum('capacity_per_hour')
+    )['total'] or 0
+    
+    theoretical_output = equipment_capacity * total_entries
+    performance_rate = (total_produced / theoretical_output * 100) if theoretical_output > 0 else 0
+    
+    total_minutes = total_entries * 60
+    availability_rate = ((total_minutes - total_downtime) / total_minutes * 100) if total_minutes > 0 else 0
+    
+    overall_efficiency = (availability_rate * performance_rate * quality_rate) / 10000
+    
+    # Quality trend (compare with previous period)
+    prev_start_date = start_date - (end_date - start_date)
+    prev_end_date = start_date - timedelta(days=1)
+    
+    prev_entries = ProductionEntry.objects.filter(
+        tenant=tenant,
+        entry_datetime__date__range=[prev_start_date, prev_end_date]
+    )
+    prev_produced = prev_entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+    prev_rejected = prev_entries.aggregate(total=Sum('quantity_rejected'))['total'] or 0
+    prev_output = prev_produced + prev_rejected
+    prev_quality = (prev_produced / prev_output * 100) if prev_output > 0 else 100
+    
+    quality_trend = quality_rate - prev_quality
+    
+    # Productivity index (normalized productivity)
+    base_productivity = 1.0  # Baseline
+    productivity_index = base_productivity * (overall_efficiency / 65)  # Normalized to 65% OEE baseline
+    
+    # Utilization rate
+    total_possible_hours = Equipment.objects.filter(tenant=tenant, is_active=True).count() * 24 * (end_date - start_date).days
+    utilization_rate = (total_entries / total_possible_hours * 100) if total_possible_hours > 0 else 0
+    
+    # Performance score (composite score)
+    performance_score = (overall_efficiency + quality_rate + utilization_rate) / 3
+    
+    return {
+        'overall_efficiency': round(overall_efficiency, 2),
+        'quality_trend': round(quality_trend, 2),
+        'productivity_index': round(productivity_index, 2),
+        'utilization_rate': round(utilization_rate, 2),
+        'performance_score': round(performance_score, 2)
+    }
+
+def get_real_time_insights(tenant, start_date, end_date):
+    """Generate real-time insights for dashboard"""
+    insights = []
+    
+    # Get current production data
+    production_entries = ProductionEntry.objects.filter(
+        tenant=tenant,
+        entry_datetime__date__range=[start_date, end_date]
+    )
+    
+    # Insight 1: Production trend
+    daily_production = []
+    current_date = start_date
+    while current_date <= end_date:
+        day_production = production_entries.filter(
+            entry_datetime__date=current_date
+        ).aggregate(total=Sum('quantity_produced'))['total'] or 0
+        daily_production.append(day_production)
+        current_date += timedelta(days=1)
+    
+    if len(daily_production) >= 2:
+        recent_trend = (daily_production[-1] - daily_production[-2]) / max(daily_production[-2], 1) * 100
+        insights.append({
+            'metric': 'Production Trend',
+            'trend': round(recent_trend, 1),
+            'description': f'Production is {"up" if recent_trend > 0 else "down"} by {abs(round(recent_trend, 1))}% compared to previous day'
+        })
+    
+    # Insight 2: Quality performance
+    total_produced = production_entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+    total_rejected = production_entries.aggregate(total=Sum('quantity_rejected'))['total'] or 0
+    total_output = total_produced + total_rejected
+    quality_rate = (total_produced / total_output * 100) if total_output > 0 else 100
+    
+    insights.append({
+        'metric': 'Quality Rate',
+        'trend': round(quality_rate - 95, 1),  # Compared to 95% target
+        'description': f'Quality rate is {round(quality_rate, 1)}% vs 95% target'
+    })
+    
+    # Insight 3: Equipment utilization
+    equipment_count = Equipment.objects.filter(tenant=tenant, is_active=True).count()
+    total_hours = (end_date - start_date).days * 24 * equipment_count
+    utilized_hours = production_entries.count()
+    utilization_rate = (utilized_hours / total_hours * 100) if total_hours > 0 else 0
+    
+    insights.append({
+        'metric': 'Equipment Utilization',
+        'trend': round(utilization_rate - 75, 1),  # Compared to 75% target
+        'description': f'Equipment utilization at {round(utilization_rate, 1)}%'
+    })
+    
+    return insights
+
+def get_analytics_alerts(tenant, start_date, end_date):
+    """Generate analytics alerts for dashboard"""
+    alerts = []
+    
+    production_entries = ProductionEntry.objects.filter(
+        tenant=tenant,
+        entry_datetime__date__range=[start_date, end_date]
+    )
+    
+    # Check for high rejection rates
+    total_produced = production_entries.aggregate(total=Sum('quantity_produced'))['total'] or 0
+    total_rejected = production_entries.aggregate(total=Sum('quantity_rejected'))['total'] or 0
+    total_output = total_produced + total_rejected
+    
+    if total_output > 0:
+        rejection_rate = (total_rejected / total_output * 100)
+        if rejection_rate > 10:
+            alerts.append({
+                'equipment_code': 'Multiple',
+                'severity': 'HIGH',
+                'message': f'High rejection rate detected: {round(rejection_rate, 1)}%',
+                'timestamp': timezone.now().strftime('%Y-%m-%d %H:%M')
+            })
+    
+    # Check for equipment with high downtime
+    equipment_downtime = production_entries.values('equipment__equipment_code').annotate(
+        total_downtime=Sum('downtime_minutes')
+    ).filter(total_downtime__gt=120)  # More than 2 hours
+    
+    for eq in equipment_downtime:
+        alerts.append({
+            'equipment_code': eq['equipment__equipment_code'],
+            'severity': 'MEDIUM',
+            'message': f'High downtime: {eq["total_downtime"]} minutes',
+            'timestamp': timezone.now().strftime('%Y-%m-%d %H:%M')
+        })
+    
+    return alerts
